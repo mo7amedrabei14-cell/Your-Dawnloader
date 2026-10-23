@@ -22,10 +22,10 @@ dawn-security = { path = "../../../crates/security" }
 dawn-downloader = { path = "../../../crates/downloader" }
 dawn-local-storage = { path = "../../../crates/local-storage" }
 dawn-api-contract = { path = "../../../crates/api-contract" }
-keyring.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+keyring = "4.2.0"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tauri = { version = "2" }
 tauri-plugin-opener = "2.7.2"
 tokio = { version = "1", features = ["sync"] }

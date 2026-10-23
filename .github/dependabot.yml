@@ -6,7 +6,17 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
   - package-ecosystem: npm
-    directory: /
+    directory: /apps/desktop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+  - package-ecosystem: npm
+    directory: /apps/extension
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+  - package-ecosystem: npm
+    directory: /apps/website
     schedule:
       interval: weekly
     open-pull-requests-limit: 10

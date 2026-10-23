@@ -1,0 +1,76 @@
+name: Deploy website to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/website/**"
+      - ".github/workflows/deploy-pages.yml"
+      - "docs/release/github-pages.md"
+  pull_request:
+    branches: [main]
+    paths:
+      - "apps/website/**"
+      - ".github/workflows/deploy-pages.yml"
+      - "docs/release/github-pages.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install website dependencies
+        working-directory: apps/website
+        run: npm install --no-audit --no-fund
+
+      - name: Type-check website
+        working-directory: apps/website
+        run: npm run typecheck
+
+      - name: Build static website
+        working-directory: apps/website
+        env:
+          NEXT_PUBLIC_BASE_PATH: /Your-Dawnloader
+          NEXT_PUBLIC_API_BASE_URL: ${{ vars.NEXT_PUBLIC_API_BASE_URL }}
+        run: npm run build
+
+      - name: Prepare Pages artifact
+        run: |
+          test -f apps/website/out/index.html
+          touch apps/website/out/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: apps/website/out
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

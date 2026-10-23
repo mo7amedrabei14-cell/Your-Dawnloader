@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal desktop window permissions with opening the account verification URL in the system browser",
+  "windows": ["main"],
+  "permissions": ["core:default", "opener:allow-open-url"]
+}

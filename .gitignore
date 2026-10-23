@@ -1,0 +1,35 @@
+# Rust
+/target/
+/**/target/
+
+# Node/frontend
+node_modules/
+.pnpm-store/
+.next/
+out/
+dist/
+coverage/
+.turbo/
+
+# Tauri artifacts
+*.app
+*.dmg
+*.msi
+*.exe
+*.AppImage
+*.deb
+*.rpm
+
+# Secrets/local
+.env
+.env.*
+!.env.example
+*.local
+.DS_Store
+Thumbs.db
+
+# Local downloads and test output
+downloads/
+*.part
+*.download
+test-output/

@@ -1,0 +1,11 @@
+{
+  "name": "your-dawnloader-monorepo",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build:desktop-ui": "npm --prefix apps/desktop run build",
+    "build:extension": "npm --prefix apps/extension run build",
+    "build:website": "npm --prefix apps/website run build",
+    "typecheck:website": "npm --prefix apps/website run typecheck"
+  }
+}

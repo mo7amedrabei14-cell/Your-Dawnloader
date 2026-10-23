@@ -74,8 +74,8 @@ pub async fn download_direct(
     fs::create_dir_all(&request.destination_dir).await?;
     let file_name = suggested_filename(response.url());
     let temporary_path = request.destination_dir.join(format!(".your-dawnloader-{}.part", Uuid::new_v4()));
-    let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary_path).await?;
     let _cleanup = TempCleanup(temporary_path.clone());
+    let mut output = OpenOptions::new().write(true).create_new(true).open(&temporary_path).await?;
     emit(&events, DownloadEvent::Started { file_name: file_name.clone(), total_bytes });
 
     let mut stream = response.bytes_stream();

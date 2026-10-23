@@ -1,0 +1,20 @@
+# Local development dependency only. Credentials below are disposable local values.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: dawnloader
+      POSTGRES_USER: dawn
+      POSTGRES_PASSWORD: dev-only-change-me
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - dawnloader-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dawn -d dawnloader"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+volumes:
+  dawnloader-postgres:

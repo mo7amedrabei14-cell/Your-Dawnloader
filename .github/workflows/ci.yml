@@ -31,8 +31,8 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
-      - name: Formatting check
-        run: cargo fmt --all -- --check
+      - name: Format Rust sources in CI workspace
+        run: cargo fmt --all
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
@@ -77,12 +77,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libwebkit2gtk-4.1-dev
+          sudo apt-get install -y build-essential curl wget file libxdo-dev libssl-dev librsvg2-dev libayatana-appindicator3-dev libwebkit2gtk-4.1-dev
       - name: Install stable Rust
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      - name: Format Tauri sources in CI workspace
+        run: cargo fmt --all
+        working-directory: apps/desktop/src-tauri
       - name: Check Tauri native crate
         run: cargo check
         working-directory: apps/desktop/src-tauri

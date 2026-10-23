@@ -9,3 +9,4 @@ license.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+dawn-api-contract = { path = "../api-contract" }

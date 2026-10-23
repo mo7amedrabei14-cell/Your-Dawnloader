@@ -1,57 +1,70 @@
 # Roadmap
 
-The full target architecture is defined now; implementation is delivered in dependency order inside the same system. “Large from day one” means all major product surfaces and contracts are designed up front, not that untested features are falsely declared complete.
+The target architecture is designed up front, while completion status reflects what is implemented and validated—not what is merely planned. CI compilation is necessary but does not substitute for production-provider, database integration, installer, or security tests.
 
 ## Workstream 0 — Foundation
 - [x] Isolated foundation branch.
 - [x] Architecture, product, security, and platform planning documents.
-- [ ] Monorepo apps/crates and versioned contracts.
-- [ ] CI, dependency policy, secret scanning, and release matrix.
-- [ ] Verify Windows development and CI builds across Windows/macOS/Linux.
+- [x] Monorepo apps/crates and shared, versioned API contracts.
+- [x] CI for Rust workspace, website, desktop frontend, extension frontend, and Tauri native compile.
+- [x] CI compilation and Rust tests across Windows, macOS, and Linux.
+- [ ] Add automated secret scanning, dependency/license policy checks, and release workflows.
+- [ ] Build and smoke-test signed installers on every advertised OS/architecture.
 
 ## Workstream 1 — Accounts/API foundations
-- [ ] Choose identity provider and document deployment/cost/privacy trade-offs.
-- [ ] Implement secure login callback/session flows and account lifecycle.
-- [ ] User-scoped API schema, migrations, owner authorization, and rate limits.
-- [ ] My Downloads metadata sync, local-only mode, export/deletion, revocation.
-- [ ] Cross-account isolation and account lifecycle regression tests.
+- [ ] Choose an identity provider and document deployment, cost, and privacy trade-offs.
+- [x] Implement OIDC authorization-code callback, PKCE, state/nonce validation, JWT/JWKS checks, hashed sessions, and CSRF protection.
+- [x] Add account schema/migrations, owner-scoped transactions, and RLS for user profile, preferences, devices, download records, and device presence.
+- [x] Implement account export and deletion endpoints and web controls.
+- [x] Implement web My Downloads metadata library, user opt-in for sync, device pairing, device list/revocation, and desktop keychain-backed device credentials.
+- [x] Add local metadata-only sync outbox, opt-in backfill, atomic queue clearing when local history is deleted, retry backoff, and cross-platform build tests.
+- [ ] Run live end-to-end tests against PostgreSQL and a real OIDC provider, including multi-user isolation and account/device lifecycle scenarios.
+- [ ] Add API rate limits/abuse controls, production DB TLS verification, recovery/session-management UX, and retention/backup-expiry policy.
 
 ## Workstream 2 — Shared download engine
-- [ ] URL security policy and bounded redirect handling.
-- [ ] Direct-file detection, metadata probe, bounded streaming, safe file writes.
-- [ ] Queue/history, progress, cancellation, retries/backoff and disk constraints.
-- [ ] Safe Range resume with validators.
-- [ ] Local fixture integration suite and recovery tests.
+- [x] URL parsing/security policy foundation and direct-file classification.
+- [x] Direct-file streaming foundation, progress events, cancellation, local SQLite history, and bounded concurrent tasks.
+- [x] Retryable local metadata outbox for opted-in account history.
+- [ ] Harden bounded redirect handling, DNS/private-network protections, safe file creation, and disk constraints with integration tests.
+- [ ] Safe Range resume using validators and crash recovery.
+- [ ] Expand local fixture, malformed-response, filesystem-failure, and recovery suites.
 
 ## Workstream 3 — Desktop
-- [ ] Premium UI, Arabic/English, RTL/LTR, themes, keyboard, reduced motion.
-- [ ] Queue/library/history/settings, folder picker, notifications, tray.
-- [ ] Tauri capability/CSP review.
-- [ ] Installer and smoke tests for every advertised desktop architecture.
+- [x] Tauri + React application foundation and cross-platform native-crate CI.
+- [x] Account connection flow, system-browser approval, OS credential-store integration, and cloud-history opt-in controls.
+- [ ] Complete product-grade UI, Arabic/English localization, RTL/LTR, themes, keyboard accessibility, and reduced-motion behavior.
+- [ ] Finish queue/library/settings UX, folder picker, notifications, tray behavior, and accessibility review.
+- [ ] Review Tauri capabilities/CSP and build/smoke-test signed installers across every advertised architecture.
 
 ## Workstream 4 — Browser extensions
-- [ ] User-triggered scan, candidate display, permissions, context menu.
+- [x] Extension frontend build in CI.
+- [ ] User-triggered scan, candidate display, minimal permissions, and context-menu flow.
 - [ ] Versioned Native Messaging host with strict schema and authorization.
-- [ ] Chrome/Edge/Firefox/Safari build, install, and smoke checks.
-- [ ] Optional sync tied to account consent; no history upload by default before consent.
+- [ ] Chrome/Edge/Firefox/Safari packaging, installation, and smoke checks.
+- [ ] Connect extension history only through account opt-in; no upload without consent.
 
 ## Workstream 5 — Media intelligence/search
-- [ ] Real source representations and normalized metadata.
+- [ ] Normalized source representations and metadata.
 - [ ] Bounded non-DRM HLS/DASH parsing.
 - [ ] Official/authorized provider search adapters and rights metadata.
 - [ ] Genuine quality selector; optional legal local conversion with license review.
-- [ ] Provider contract fixtures and quotas.
+- [ ] Provider contract fixtures, quotas, and abuse controls.
 
 ## Workstream 6 — Website/distribution
-- [ ] Public website and secure account/library screens.
-- [ ] SEO/documentation/release pages.
+- [x] Public-site foundation and account/library screens.
+- [x] Account connection and connected-device management screens.
+- [ ] Complete documentation, compatibility, release, support, and SEO pages.
 - [ ] Multi-OS packages, checksums, SBOM, signing/notarization.
-- [ ] Safe updater/rollback, privacy, security disclosure and retention documents.
+- [ ] Safe updater/rollback, final legal/privacy notices, security disclosure, and published retention policy.
 
 ## Workstream 7 — Scale/mobile
-- [ ] Stateless API scaling, DB indexing/pooling, cache/queue policies and observability.
-- [ ] Per-user quota/abuse controls and privacy-respecting metrics.
-- [ ] Android/iOS implementations and store reviews.
-- [ ] Performance/fuzz/accessibility audits and external security review.
+- [ ] Stateless API scaling, DB indexing/pooling, cache/queue policies, and observability.
+- [ ] Per-user quotas/abuse controls and privacy-respecting metrics.
+- [ ] Android/iOS implementations, device validation, and store reviews.
+- [ ] Performance, fuzz, accessibility, and external security audits.
+
+## Validation status
+- The CI workflow has passed for the current implementation on Windows, macOS, and Linux.
+- CI does not verify a live OIDC identity provider, deployed PostgreSQL configuration, browser cookie behavior in production, data deletion at a deployed provider, signed installers, or external security readiness. Do not call the project production-ready until those checks are completed.
 
 Use parallel contributors only for isolated files/contracts; one integration owner is responsible for shared interfaces.

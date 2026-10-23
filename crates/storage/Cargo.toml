@@ -10,3 +10,5 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 dawn-api-contract = { path = "../api-contract" }
+
+serde_json.workspace = true

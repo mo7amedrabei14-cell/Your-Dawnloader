@@ -127,6 +127,46 @@ export default function MyDownloadsClient() {
     } finally { setWorking(false); }
   }
 
+  async function exportAccount() {
+    setWorking(true); setError(""); setSuccess("");
+    try {
+      const response = await apiFetch("/api/v1/me/export");
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({})) as { error?: string };
+        throw new Error(body.error || "Could not export account data.");
+      }
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = objectUrl;
+      anchor.download = "your-dawnloader-account-export.json";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(objectUrl);
+      setSuccess("Your account data export was downloaded.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not export account data.");
+    } finally { setWorking(false); }
+  }
+
+  async function deleteAccount() {
+    if (window.prompt("This permanently deletes your account and its cloud metadata. Local media files remain. Type DELETE to confirm.") !== "DELETE") return;
+    setWorking(true); setError(""); setSuccess("");
+    try {
+      const token = await csrfToken();
+      await responseData(await apiFetch("/api/v1/me", {
+        method: "DELETE",
+        headers: { "X-CSRF-Token": token },
+      }));
+      setAccount(null);
+      setRecords([]);
+      setSuccess("Account deleted. Files already saved on devices remain untouched.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not delete account.");
+    } finally { setWorking(false); }
+  }
+
   async function logout() {
     setWorking(true); setError(""); setSuccess("");
     try {
@@ -171,7 +211,11 @@ export default function MyDownloadsClient() {
           <>
             <div className="account-summary">
               <div><span className="summary-label">SIGNED IN AS</span><strong>{account.display_name || account.email || "Your account"}</strong><span className="muted">{account.email || "Identity-provider account"}</span></div>
-              <span className="account-private">Private account</span>
+              <div className="account-actions">
+                <span className="account-private">Private account</span>
+                <button className="secondary" onClick={exportAccount} disabled={working}>Export data</button>
+                <button className="text-danger" onClick={deleteAccount} disabled={working}>Delete account</button>
+              </div>
             </div>
 
             <div className="sync-setting">

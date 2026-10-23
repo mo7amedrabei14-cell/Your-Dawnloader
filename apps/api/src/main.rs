@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 const SESSION_COOKIE: &str = "dawn_session";
 const CSRF_COOKIE: &str = "dawn_csrf";
+const OIDC_STATE_COOKIE: &str = "dawn_oidc_state";
 const SESSION_SECONDS: i64 = 60 * 60 * 24 * 30;
 const TOKEN_MAX_BYTES: usize = 16 * 1024;
 
@@ -322,7 +323,7 @@ async fn csrf(
     Ok(response)
 }
 
-async fn oidc_login(State(state): State<AppState>) -> Result<Redirect, (StatusCode, Json<Value>)> {
+async fn oidc_login(State(state): State<AppState>) -> Result<Response, (StatusCode, Json<Value>)> {
     let oauth_state = random_token();
     let nonce = random_token();
     let verifier = random_token() + &random_token();
@@ -341,11 +342,18 @@ async fn oidc_login(State(state): State<AppState>) -> Result<Redirect, (StatusCo
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
-    Ok(Redirect::temporary(url.as_str()))
+    let mut response = Redirect::temporary(url.as_str()).into_response();
+    let secure = if state.config.cookie_secure { "; Secure" } else { "" };
+    let state_cookie = HeaderValue::from_str(&format!(
+        "{OIDC_STATE_COOKIE}={oauth_state}; Path=/; Max-Age=600; SameSite=Lax; HttpOnly{secure}"
+    )).map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?;
+    response.headers_mut().append(header::SET_COOKIE, state_cookie);
+    Ok(response)
 }
 
 async fn oidc_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<CallbackQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     if query.error.is_some() {
@@ -355,6 +363,9 @@ async fn oidc_callback(
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "authorization_code_missing"))?;
     let raw_state = query.state.filter(|value| !value.is_empty() && value.len() <= 512)
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "oauth_state_missing"))?;
+    if cookie_value(&headers, OIDC_STATE_COOKIE).as_deref() != Some(raw_state.as_str()) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "oauth_state_browser_mismatch"));
+    }
     let login_state = state.storage.consume_login_state(&sha256_hex(&raw_state)).await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "login_state_lookup_failed"))?
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "oauth_state_invalid_or_expired"))?;
@@ -425,6 +436,11 @@ async fn oidc_callback(
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?);
     response.headers_mut().append(header::SET_COOKIE, make_cookie(&state.config, CSRF_COOKIE, &csrf, SESSION_SECONDS, false)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?);
+    let secure = if state.config.cookie_secure { "; Secure" } else { "" };
+    let expired_state = HeaderValue::from_str(&format!(
+        "{OIDC_STATE_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly{secure}"
+    )).map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?;
+    response.headers_mut().append(header::SET_COOKIE, expired_state);
     Ok(response)
 }
 
@@ -524,6 +540,44 @@ async fn clear_downloads(
     Ok(Json(json!({"deleted_records": deleted})))
 }
 
+async fn export_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let (_, user) = authenticate(&state, &headers).await?;
+    let export = state.storage.export_account_data(user.user_id).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_export_failed"))?;
+    let body = serde_json::to_vec_pretty(&export)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_export_serialization_failed"))?;
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"));
+    response.headers_mut().insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=\"your-dawnloader-account-export.json\""));
+    response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+async fn delete_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let (session, user) = authenticate(&state, &headers).await?;
+    check_csrf(&state, &headers, &session).await?;
+    let deleted = state.storage.delete_account(user.user_id).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_deletion_failed"))?;
+    if !deleted {
+        return Err(api_error(StatusCode::NOT_FOUND, "account_not_found"));
+    }
+    let mut response = (StatusCode::OK, Json(json!({
+        "deleted": true,
+        "message": "Account data was deleted. Local media files on devices are not affected."
+    }))).into_response();
+    response.headers_mut().append(header::SET_COOKIE, make_cookie(&state.config, SESSION_COOKIE, "", 0, true)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?);
+    response.headers_mut().append(header::SET_COOKIE, make_cookie(&state.config, CSRF_COOKIE, "", 0, false)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?);
+    Ok(response)
+}
+
 async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -575,7 +629,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/oidc/login", get(oidc_login))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/api/v1/csrf", get(csrf))
-        .route("/api/v1/me", get(me))
+        .route("/api/v1/me", get(me).delete(delete_account))
+        .route("/api/v1/me/export", get(export_account))
         .route("/api/v1/me/preferences", put(update_preferences))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/downloads", get(list_downloads).post(upsert_download).delete(clear_downloads))

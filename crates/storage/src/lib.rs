@@ -339,4 +339,119 @@ impl Storage {
         tx.commit().await?;
         Ok(result.rows_affected())
     }
+
+    /// Produces an account data export without session/CSRF token hashes or media bytes.
+    pub async fn export_account_data(&self, user_id: Uuid) -> Result<serde_json::Value, StorageError> {
+        let mut tx = self.begin_user_transaction(user_id).await?;
+
+        let account = sqlx::query(
+            "SELECT id, identity_issuer, identity_subject,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+             FROM app_users WHERE id=$1"
+        )
+        .bind(user_id).fetch_one(&mut *tx).await?;
+
+        let profile = sqlx::query(
+            "SELECT display_name, email, email_verified, locale,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+             FROM user_profiles WHERE owner_user_id=$1"
+        )
+        .bind(user_id).fetch_optional(&mut *tx).await?;
+
+        let preferences = sqlx::query(
+            "SELECT sync_download_history, theme,
+                    to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
+             FROM account_preferences WHERE owner_user_id=$1"
+        )
+        .bind(user_id).fetch_optional(&mut *tx).await?;
+
+        let device_rows = sqlx::query(
+            "SELECT id, device_label, platform,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                    to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_seen_at,
+                    (revoked_at IS NOT NULL) AS revoked
+             FROM user_devices WHERE owner_user_id=$1 ORDER BY created_at ASC"
+        )
+        .bind(user_id).fetch_all(&mut *tx).await?;
+
+        let download_rows = sqlx::query(
+            "SELECT id, source_domain, provider_item_key, display_name, media_kind, container, quality_label, status,
+                    (EXTRACT(EPOCH FROM completed_at) * 1000)::BIGINT AS completed_at_unix_ms,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_unix_ms
+             FROM download_records WHERE owner_user_id=$1 ORDER BY created_at ASC, id ASC"
+        )
+        .bind(user_id).fetch_all(&mut *tx).await?;
+
+        let devices = device_rows.into_iter().map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id")?,
+                "label": row.try_get::<Option<String>, _>("device_label")?,
+                "platform": row.try_get::<String, _>("platform")?,
+                "created_at": row.try_get::<Option<String>, _>("created_at")?,
+                "last_seen_at": row.try_get::<Option<String>, _>("last_seen_at")?,
+                "revoked": row.try_get::<bool, _>("revoked")?
+            }))
+        }).collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let downloads = download_rows.into_iter().map(|row| {
+            Ok(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id")?,
+                "source_domain": row.try_get::<String, _>("source_domain")?,
+                "provider_item_key": row.try_get::<Option<String>, _>("provider_item_key")?,
+                "display_name": row.try_get::<Option<String>, _>("display_name")?,
+                "media_kind": row.try_get::<String, _>("media_kind")?,
+                "container": row.try_get::<Option<String>, _>("container")?,
+                "quality_label": row.try_get::<Option<String>, _>("quality_label")?,
+                "status": row.try_get::<String, _>("status")?,
+                "completed_at_unix_ms": row.try_get::<Option<i64>, _>("completed_at_unix_ms")?,
+                "created_at_unix_ms": row.try_get::<i64, _>("created_at_unix_ms")?
+            }))
+        }).collect::<Result<Vec<_>, sqlx::Error>>()?;
+
+        let account_json = serde_json::json!({
+            "id": account.try_get::<Uuid, _>("id")?,
+            "identity_issuer": account.try_get::<String, _>("identity_issuer")?,
+            "identity_subject": account.try_get::<String, _>("identity_subject")?,
+            "created_at": account.try_get::<Option<String>, _>("created_at")?
+        });
+        let profile_json = if let Some(row) = profile {
+            serde_json::json!({
+                "display_name": row.try_get::<Option<String>, _>("display_name")?,
+                "email": row.try_get::<Option<String>, _>("email")?,
+                "email_verified": row.try_get::<bool, _>("email_verified")?,
+                "locale": row.try_get::<String, _>("locale")?,
+                "created_at": row.try_get::<Option<String>, _>("created_at")?
+            })
+        } else { serde_json::Value::Null };
+        let preferences_json = if let Some(row) = preferences {
+            serde_json::json!({
+                "sync_download_history": row.try_get::<bool, _>("sync_download_history")?,
+                "theme": row.try_get::<String, _>("theme")?,
+                "updated_at": row.try_get::<Option<String>, _>("updated_at")?
+            })
+        } else { serde_json::Value::Null };
+
+        tx.commit().await?;
+        Ok(serde_json::json!({
+            "schema_version": 1,
+            "exported_at": sqlx::query_scalar::<_, String>("SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')")
+                .fetch_one(&self.pool).await?,
+            "account": account_json,
+            "profile": profile_json,
+            "preferences": preferences_json,
+            "devices": devices,
+            "download_history": downloads,
+            "notice": "This export contains account metadata, not media files, local device paths, or active session credentials."
+        }))
+    }
+
+    /// Permanently deletes the account and dependent cloud metadata via declared foreign-key cascades.
+    /// The caller must pass the user ID resolved from the active verified session.
+    pub async fn delete_account(&self, user_id: Uuid) -> Result<bool, StorageError> {
+        let mut tx = self.begin_user_transaction(user_id).await?;
+        let result = sqlx::query("DELETE FROM app_users WHERE id=$1")
+            .bind(user_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
+    }
 }

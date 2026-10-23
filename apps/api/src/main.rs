@@ -13,7 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dawn_api_contract::UpsertDownloadRecordRequest;
-use dawn_storage::{SessionIdentity, Storage};
+use dawn_storage::{DeviceIdentity, DeviceLinkStatus, SessionIdentity, Storage};
 use jsonwebtoken::{
     decode, decode_header,
     jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse},
@@ -204,12 +204,68 @@ struct CallbackQuery {
     error: Option<String>,
 }
 #[derive(Debug, Deserialize)]
+struct LoginQuery {
+    return_to: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceAuthStartRequest {
+    device_label: Option<String>,
+    platform: Option<String>,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceAuthPollRequest {
+    device_code: String,
+}
+#[derive(Debug, Deserialize)]
+struct DeviceAuthApproveRequest {
+    user_code: String,
+}
+#[derive(Debug, Deserialize)]
 struct ListQuery {
     limit: Option<u32>,
 }
 #[derive(Debug, Deserialize)]
 struct PreferenceRequest {
     sync_download_history: bool,
+}
+
+fn validated_return_to(candidate: Option<&str>) -> String {
+    let Some(candidate) = candidate else { return "/account/downloads".to_owned() };
+    if candidate.is_empty() || candidate.len() > 1024 || !candidate.starts_with('/')
+        || candidate.starts_with("//") || candidate.contains('\\')
+        || candidate.chars().any(char::is_control) {
+        return "/account/downloads".to_owned();
+    }
+    let Ok(base) = Url::parse("https://your-dawnloader.invalid/") else {
+        return "/account/downloads".to_owned();
+    };
+    let Ok(parsed) = base.join(candidate) else { return "/account/downloads".to_owned() };
+    if parsed.host_str() != base.host_str() || parsed.scheme() != base.scheme()
+        || !matches!(parsed.path(), "/account/downloads" | "/account/connect") {
+        return "/account/downloads".to_owned();
+    }
+    candidate.to_owned()
+}
+
+fn normalize_user_code(value: &str) -> Option<String> {
+    let normalized: String = value.chars()
+        .filter(|character| *character != '-' && !character.is_whitespace())
+        .map(|character| character.to_ascii_uppercase())
+        .collect();
+    if normalized.len() != 8
+        || !normalized.bytes().all(|byte| b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ".contains(&byte)) {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn create_user_code() -> String {
+    const ALPHABET: &[u8] = b"23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+    let entropy = Uuid::new_v4().into_bytes();
+    let chars: String = entropy.iter().take(8)
+        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
+        .collect();
+    format!("{}-{}", &chars[..4], &chars[4..])
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -283,6 +339,155 @@ async fn check_csrf(
     Ok(())
 }
 
+async fn start_device_auth(
+    State(state): State<AppState>,
+    Json(request): Json<DeviceAuthStartRequest>,
+) -> Result<(StatusCode, Json<Value>), (StatusCode, Json<Value>)> {
+    let label = request.device_label.unwrap_or_else(|| "Your Dawnloader desktop".to_owned()).trim().to_owned();
+    if label.is_empty() || label.chars().count() > 80 || label.chars().any(char::is_control) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "device_label_invalid"));
+    }
+    let platform = request.platform.unwrap_or_else(|| "unknown".to_owned()).to_ascii_lowercase();
+    if !matches!(platform.as_str(), "windows" | "macos" | "linux" | "unknown") {
+        return Err(api_error(StatusCode::BAD_REQUEST, "device_platform_invalid"));
+    }
+
+    let device_code = random_token() + &random_token();
+    let user_code = create_user_code();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    state.storage.create_device_link_request(
+        &sha256_hex(&device_code), &sha256_hex(&user_code.replace('-', "")),
+        &label, &platform, now + 600,
+    ).await.map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_authorization_start_failed"))?;
+
+    let mut verification_url = Url::parse(&format!("{}/account/connect", state.config.app_base_url))
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "website_url_invalid"))?;
+    verification_url.query_pairs_mut().append_pair("user_code", &user_code);
+    Ok((StatusCode::CREATED, Json(json!({
+        "device_code": device_code, "user_code": user_code,
+        "verification_url": verification_url.as_str(), "expires_in_seconds": 600,
+        "interval_seconds": 3
+    }))))
+}
+
+async fn poll_device_auth(
+    State(state): State<AppState>,
+    Json(request): Json<DeviceAuthPollRequest>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    if request.device_code.len() < 32 || request.device_code.len() > 128
+        || !request.device_code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "device_code_invalid"));
+    }
+    let status = state.storage.device_link_status(&sha256_hex(&request.device_code)).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_authorization_lookup_failed"))?;
+    match status {
+        Some(DeviceLinkStatus::Pending) => Ok((StatusCode::ACCEPTED, Json(json!({"status":"pending","interval_seconds":3}))).into_response()),
+        Some(DeviceLinkStatus::Expired) => Ok((StatusCode::GONE, Json(json!({"status":"expired"}))).into_response()),
+        Some(DeviceLinkStatus::Revoked) => Ok((StatusCode::GONE, Json(json!({"status":"revoked"}))).into_response()),
+        Some(DeviceLinkStatus::Authorized(device)) => Ok((StatusCode::OK, Json(json!({
+            "status":"authorized", "device_id":device.device_id,
+            "display_name":device.identity.display_name, "email":device.identity.email,
+            "sync_download_history":device.identity.sync_download_history,
+            "device_label":device.device_label, "platform":device.platform
+        }))).into_response()),
+        None => Err(api_error(StatusCode::NOT_FOUND, "device_code_unknown")),
+    }
+}
+
+async fn approve_device_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceAuthApproveRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (session, user) = authenticate(&state, &headers).await?;
+    check_csrf(&state, &headers, &session).await?;
+    let user_code = normalize_user_code(&request.user_code)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "device_user_code_invalid"))?;
+    let device_id = state.storage.approve_device_link(user.user_id, &sha256_hex(&user_code)).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_authorization_approve_failed"))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "device_authorization_expired_or_invalid"))?;
+    Ok(Json(json!({"approved":true,"device_id":device_id})))
+}
+
+async fn authenticate_device(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<DeviceIdentity, (StatusCode, Json<Value>)> {
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok())
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "device_authentication_required"))?;
+    let token = authorization.strip_prefix("Bearer ")
+        .filter(|value| value.len() >= 32 && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "device_token_invalid"))?;
+    state.storage.device_identity(&sha256_hex(token)).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_authentication_failed"))?
+        .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "device_not_authorized"))
+}
+
+async fn device_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = authenticate_device(&state, &headers).await?;
+    Ok(Json(json!({
+        "user": {
+            "id":device.identity.user_id, "email":device.identity.email,
+            "display_name":device.identity.display_name, "locale":device.identity.locale,
+            "sync_download_history":device.identity.sync_download_history
+        },
+        "device": {"id":device.device_id,"label":device.device_label,"platform":device.platform}
+    })))
+}
+
+async fn update_device_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PreferenceRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = authenticate_device(&state, &headers).await?;
+    state.storage.set_download_sync(device.identity.user_id, request.sync_download_history).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "preference_update_failed"))?;
+    Ok(Json(json!({"sync_download_history":request.sync_download_history})))
+}
+
+async fn sync_device_download(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut request): Json<UpsertDownloadRecordRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = authenticate_device(&state, &headers).await?;
+    if !device.identity.sync_download_history {
+        return Err(api_error(StatusCode::FORBIDDEN, "download_history_sync_disabled"));
+    }
+    request.source_domain = request.source_domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if request.source_domain.is_empty() || request.source_domain.len() > 253
+        || request.source_domain.chars().any(|character| !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | ':'))) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "source_domain_invalid"));
+    }
+    if request.display_name.as_ref().is_some_and(|value| value.trim().is_empty() || value.chars().count() > 300)
+        || request.provider_item_key.as_ref().is_some_and(|value| value.chars().count() > 256)
+        || request.container.as_ref().is_some_and(|value| value.chars().count() > 32)
+        || request.quality_label.as_ref().is_some_and(|value| value.chars().count() > 80) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "download_record_invalid"));
+    }
+    if request.completed_at_unix_ms.is_some_and(|value| value < 0) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "download_timestamp_invalid"));
+    }
+    let record = state.storage.upsert_download_record(device.identity.user_id, &request).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "download_record_save_failed"))?;
+    serde_json::to_value(record).map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response_serialization_failed"))
+}
+
+async fn disconnect_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let device = authenticate_device(&state, &headers).await?;
+    state.storage.revoke_device(device.identity.user_id, device.device_id).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_disconnect_failed"))?;
+    Ok(Json(json!({"disconnected":true})))
+}
+
 async fn live() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({"status":"live","service":"dawn-api"})))
 }
@@ -323,12 +528,16 @@ async fn csrf(
     Ok(response)
 }
 
-async fn oidc_login(State(state): State<AppState>) -> Result<Response, (StatusCode, Json<Value>)> {
+async fn oidc_login(
+    State(state): State<AppState>,
+    Query(query): Query<LoginQuery>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let return_to = validated_return_to(query.return_to.as_deref());
     let oauth_state = random_token();
     let nonce = random_token();
     let verifier = random_token() + &random_token();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    state.storage.create_login_state(&sha256_hex(&oauth_state), &nonce, &verifier).await
+    state.storage.create_login_state(&sha256_hex(&oauth_state), &nonce, &verifier, &return_to).await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "login_start_failed"))?;
 
     let mut url = Url::parse(&state.config.authorization_url)
@@ -430,7 +639,7 @@ async fn oidc_callback(
     state.storage.create_session(user_id, &sha256_hex(&session), &sha256_hex(&csrf), now + SESSION_SECONDS).await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "session_creation_failed"))?;
 
-    let target = format!("{}/account/downloads", state.config.app_base_url);
+    let target = format!("{}{}", state.config.app_base_url, login_state.return_to.as_deref().unwrap_or("/account/downloads"));
     let mut response = Redirect::temporary(&target).into_response();
     response.headers_mut().append(header::SET_COOKIE, make_cookie(&state.config, SESSION_COOKIE, &session, SESSION_SECONDS, true)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "cookie_configuration_error"))?);
@@ -620,6 +829,7 @@ async fn main() -> anyhow::Result<()> {
             header::CONTENT_TYPE,
             header::ORIGIN,
             HeaderName::from_static("x-csrf-token"),
+            header::AUTHORIZATION,
         ]);
 
     let state = AppState { storage, config: Arc::new(auth), http: client, jwks };
@@ -627,6 +837,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route("/auth/oidc/login", get(oidc_login))
+        .route("/api/v1/device-auth/start", post(start_device_auth))
+        .route("/api/v1/device-auth/poll", post(poll_device_auth))
+        .route("/api/v1/device-auth/approve", post(approve_device_auth))
+        .route("/api/v1/device/me", get(device_me))
+        .route("/api/v1/device/me/preferences", put(update_device_preferences))
+        .route("/api/v1/device/downloads", post(sync_device_download))
+        .route("/api/v1/device/disconnect", post(disconnect_device))
         .route("/auth/oidc/callback", get(oidc_callback))
         .route("/api/v1/csrf", get(csrf))
         .route("/api/v1/me", get(me).delete(delete_account))

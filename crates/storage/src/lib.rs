@@ -27,6 +27,23 @@ pub struct Storage { pool: PgPool }
 pub struct LoginState {
     pub nonce: String,
     pub pkce_verifier: String,
+    pub return_to: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceIdentity {
+    pub identity: SessionIdentity,
+    pub device_id: Uuid,
+    pub device_label: Option<String>,
+    pub platform: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceLinkStatus {
+    Pending,
+    Authorized(DeviceIdentity),
+    Expired,
+    Revoked,
 }
 
 #[derive(Debug, Clone)]
@@ -67,9 +84,9 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn create_login_state(&self, state_hash: &str, nonce: &str, pkce_verifier: &str) -> Result<(), StorageError> {
-        sqlx::query("INSERT INTO oidc_login_states(state_hash, nonce, pkce_verifier) VALUES ($1,$2,$3)")
-            .bind(state_hash).bind(nonce).bind(pkce_verifier)
+    pub async fn create_login_state(&self, state_hash: &str, nonce: &str, pkce_verifier: &str, return_to: &str) -> Result<(), StorageError> {
+        sqlx::query("INSERT INTO oidc_login_states(state_hash, nonce, pkce_verifier, return_to) VALUES ($1,$2,$3,$4)")
+            .bind(state_hash).bind(nonce).bind(pkce_verifier).bind(return_to)
             .execute(&self.pool).await?;
         Ok(())
     }
@@ -79,13 +96,14 @@ impl Storage {
         sqlx::query("DELETE FROM oidc_login_states WHERE expires_at <= now()").execute(&self.pool).await?;
         let row = sqlx::query(
             "DELETE FROM oidc_login_states WHERE state_hash=$1 AND expires_at > now()
-             RETURNING nonce, pkce_verifier"
+             RETURNING nonce, pkce_verifier, return_to"
         )
         .bind(state_hash).fetch_optional(&self.pool).await?;
         if let Some(row) = row {
             Ok(Some(LoginState {
                 nonce: row.try_get::<String, _>("nonce")?,
                 pkce_verifier: row.try_get::<String, _>("pkce_verifier")?,
+                return_to: row.try_get::<Option<String>, _>("return_to")?,
             }))
         } else {
             Ok(None)
@@ -443,6 +461,155 @@ impl Storage {
             "download_history": downloads,
             "notice": "This export contains account metadata, not media files, local device paths, or active session credentials."
         }))
+    }
+
+    pub async fn create_device_link_request(
+        &self,
+        device_code_hash: &str,
+        user_code_hash: &str,
+        device_label: &str,
+        platform: &str,
+        expires_at_unix: i64,
+    ) -> Result<(), StorageError> {
+        sqlx::query("DELETE FROM device_link_requests WHERE approved_at IS NULL AND expires_at <= now()")
+            .execute(&self.pool).await?;
+        sqlx::query(
+            "INSERT INTO device_link_requests(
+                id, device_code_hash, user_code_hash, device_label, platform, expires_at
+             ) VALUES ($1,$2,$3,$4,$5,to_timestamp($6))"
+        )
+        .bind(Uuid::new_v4()).bind(device_code_hash).bind(user_code_hash)
+        .bind(device_label).bind(platform).bind(expires_at_unix)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Atomically associates the pending device code with the already authenticated website account.
+    pub async fn approve_device_link(&self, owner_user_id: Uuid, user_code_hash: &str) -> Result<Option<Uuid>, StorageError> {
+        let mut tx = self.begin_user_transaction(owner_user_id).await?;
+        let request = sqlx::query(
+            "SELECT id, device_label, platform
+             FROM device_link_requests
+             WHERE user_code_hash=$1 AND owner_user_id IS NULL AND device_id IS NULL
+               AND approved_at IS NULL AND revoked_at IS NULL AND expires_at > now()
+             FOR UPDATE"
+        )
+        .bind(user_code_hash).fetch_optional(&mut *tx).await?;
+        let Some(request) = request else { return Ok(None) };
+        let request_id: Uuid = request.try_get("id")?;
+        let device_label: String = request.try_get("device_label")?;
+        let platform: String = request.try_get("platform")?;
+        let device_id = Uuid::new_v4();
+
+        sqlx::query("INSERT INTO user_devices(id, owner_user_id, device_label, platform) VALUES ($1,$2,$3,$4)")
+            .bind(device_id).bind(owner_user_id).bind(device_label).bind(platform)
+            .execute(&mut *tx).await?;
+        let updated = sqlx::query(
+            "UPDATE device_link_requests SET owner_user_id=$2, device_id=$3, approved_at=now()
+             WHERE id=$1 AND owner_user_id IS NULL AND approved_at IS NULL"
+        )
+        .bind(request_id).bind(owner_user_id).bind(device_id).execute(&mut *tx).await?;
+        if updated.rows_affected() != 1 {
+            return Err(StorageError::Migration("device authorization changed while being approved".to_owned()));
+        }
+        tx.commit().await?;
+        Ok(Some(device_id))
+    }
+
+    pub async fn device_link_status(&self, device_code_hash: &str) -> Result<Option<DeviceLinkStatus>, StorageError> {
+        let row = sqlx::query(
+            "SELECT owner_user_id, approved_at IS NOT NULL AS approved,
+                    revoked_at IS NOT NULL AS revoked, expires_at > now() AS unexpired
+             FROM device_link_requests WHERE device_code_hash=$1"
+        )
+        .bind(device_code_hash).fetch_optional(&self.pool).await?;
+        let Some(row) = row else { return Ok(None) };
+        let approved: bool = row.try_get("approved")?;
+        let revoked: bool = row.try_get("revoked")?;
+        let unexpired: bool = row.try_get("unexpired")?;
+        let owner_user_id: Option<Uuid> = row.try_get("owner_user_id")?;
+        if revoked {
+            return Ok(Some(DeviceLinkStatus::Revoked));
+        }
+        if approved && owner_user_id.is_some() {
+            return Ok(match self.device_identity(device_code_hash).await? {
+                Some(identity) => Some(DeviceLinkStatus::Authorized(identity)),
+                None => Some(DeviceLinkStatus::Revoked),
+            });
+        }
+        if !unexpired {
+            return Ok(Some(DeviceLinkStatus::Expired));
+        }
+        Ok(Some(DeviceLinkStatus::Pending))
+    }
+
+    /// A device code becomes a bearer credential only after approval. Only its hash is stored.
+    pub async fn device_identity(&self, device_code_hash: &str) -> Result<Option<DeviceIdentity>, StorageError> {
+        let owner = sqlx::query(
+            "SELECT owner_user_id, device_id FROM device_link_requests
+             WHERE device_code_hash=$1 AND owner_user_id IS NOT NULL
+               AND device_id IS NOT NULL AND approved_at IS NOT NULL AND revoked_at IS NULL"
+        )
+        .bind(device_code_hash).fetch_optional(&self.pool).await?;
+        let Some(owner) = owner else { return Ok(None) };
+        let owner_user_id: Uuid = owner.try_get("owner_user_id")?;
+        let device_id: Uuid = owner.try_get("device_id")?;
+        let mut tx = self.begin_user_transaction(owner_user_id).await?;
+        let row = sqlx::query(
+            "SELECT u.id AS user_id, u.identity_issuer AS issuer, u.identity_subject AS subject,
+                    p.email, p.email_verified, p.display_name, p.locale,
+                    COALESCE(pref.sync_download_history, FALSE) AS sync_download_history,
+                    d.id AS device_id, d.device_label, d.platform
+             FROM device_link_requests r
+             JOIN user_devices d ON d.id=r.device_id AND d.owner_user_id=r.owner_user_id
+             JOIN app_users u ON u.id=r.owner_user_id
+             LEFT JOIN user_profiles p ON p.owner_user_id=u.id
+             LEFT JOIN account_preferences pref ON pref.owner_user_id=u.id
+             WHERE r.device_code_hash=$1 AND r.owner_user_id=$2 AND r.device_id=$3
+               AND r.approved_at IS NOT NULL AND r.revoked_at IS NULL AND d.revoked_at IS NULL"
+        )
+        .bind(device_code_hash).bind(owner_user_id).bind(device_id)
+        .fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let identity = SessionIdentity {
+            user_id: row.try_get("user_id")?,
+            issuer: row.try_get("issuer")?,
+            subject: row.try_get("subject")?,
+            email: row.try_get("email")?,
+            email_verified: row.try_get("email_verified")?,
+            display_name: row.try_get("display_name")?,
+            locale: row.try_get("locale")?,
+            sync_download_history: row.try_get("sync_download_history")?,
+        };
+        let device = DeviceIdentity {
+            identity,
+            device_id: row.try_get("device_id")?,
+            device_label: row.try_get("device_label")?,
+            platform: row.try_get("platform")?,
+        };
+        sqlx::query("UPDATE user_devices SET last_seen_at=now() WHERE id=$1 AND owner_user_id=$2")
+            .bind(device_id).bind(owner_user_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(device))
+    }
+
+    pub async fn revoke_device(&self, owner_user_id: Uuid, device_id: Uuid) -> Result<bool, StorageError> {
+        let mut tx = self.begin_user_transaction(owner_user_id).await?;
+        let result = sqlx::query(
+            "UPDATE user_devices SET revoked_at=COALESCE(revoked_at, now())
+             WHERE owner_user_id=$1 AND id=$2 AND revoked_at IS NULL"
+        )
+        .bind(owner_user_id).bind(device_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "UPDATE device_link_requests SET revoked_at=COALESCE(revoked_at, now())
+             WHERE owner_user_id=$1 AND device_id=$2 AND revoked_at IS NULL"
+        )
+        .bind(owner_user_id).bind(device_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
     /// Permanently deletes the account and dependent cloud metadata via declared foreign-key cascades.

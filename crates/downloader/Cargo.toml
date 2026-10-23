@@ -1,0 +1,16 @@
+[package]
+name = "dawn-downloader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+dawn-security = { path = "../security" }
+futures-util.workspace = true
+reqwest.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+uuid.workspace = true

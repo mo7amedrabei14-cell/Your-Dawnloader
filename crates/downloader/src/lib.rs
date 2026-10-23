@@ -116,7 +116,7 @@ fn reject_html(response: &Response) -> Result<(), DownloadError> {
 
 fn suggested_filename(url: &Url) -> String {
     let raw = url.path_segments()
-        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))
         .unwrap_or("download.bin");
     sanitize_filename(raw)
 }

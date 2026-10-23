@@ -11,6 +11,14 @@ type Account = {
   locale: string;
   preferences: { sync_download_history: boolean };
 };
+type AccountDevice = {
+  id: string;
+  label: string | null;
+  platform: string;
+  created_at: string | null;
+  last_seen_at: string | null;
+  revoked: boolean;
+};
 type DownloadRecord = {
   id: string;
   source_domain: string;
@@ -46,6 +54,7 @@ async function csrfToken(): Promise<string> {
 export default function MyDownloadsClient() {
   const [account, setAccount] = useState<Account | null>(null);
   const [records, setRecords] = useState<DownloadRecord[]>([]);
+  const [devices, setDevices] = useState<AccountDevice[]>([]);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
@@ -64,6 +73,8 @@ export default function MyDownloadsClient() {
       }
       const user = await responseData<Account>(me);
       setAccount(user);
+      const devicePage = await responseData<{ devices: AccountDevice[] }>(await apiFetch("/api/v1/me/devices"));
+      setDevices(devicePage.devices);
       if (!user.preferences.sync_download_history) {
         setRecords([]);
       } else {
@@ -150,6 +161,21 @@ export default function MyDownloadsClient() {
     } finally { setWorking(false); }
   }
 
+  async function revokeDevice(id: string) {
+    if (!window.confirm("Disconnect this device? It will no longer be able to sync account history.")) return;
+    setWorking(true); setError(""); setSuccess("");
+    try {
+      const token = await csrfToken();
+      await responseData(await apiFetch("/api/v1/me/devices/" + encodeURIComponent(id), {
+        method: "DELETE", headers: { "X-CSRF-Token": token },
+      }));
+      setDevices(rows => rows.map(device => device.id === id ? { ...device, revoked: true } : device));
+      setSuccess("Device disconnected. Its local media files and local history remain on that device.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not disconnect this device.");
+    } finally { setWorking(false); }
+  }
+
   async function deleteAccount() {
     if (window.prompt("This permanently deletes your account and its cloud metadata. Local media files remain. Type DELETE to confirm.") !== "DELETE") return;
     setWorking(true); setError(""); setSuccess("");
@@ -217,6 +243,21 @@ export default function MyDownloadsClient() {
                 <button className="text-danger" onClick={deleteAccount} disabled={working}>Delete account</button>
               </div>
             </div>
+
+            <section className="devices-section" aria-labelledby="devices-heading">
+              <div className="devices-heading"><div><h2 id="devices-heading">Connected devices</h2><p>Only devices authorized by you can sync history. You can revoke access here.</p></div><span>{devices.filter(device => !device.revoked).length} active</span></div>
+              {devices.length === 0 ? <p className="devices-empty">No devices connected yet. Link a desktop from the Your Dawnloader app.</p> : (
+                <div className="devices-list">
+                  {devices.map(device => (
+                    <article className="device-row" key={device.id}>
+                      <span className="device-symbol">{device.platform === "windows" ? "▣" : device.platform === "macos" ? "▤" : "⌘"}</span>
+                      <div className="device-info"><strong>{device.label || "Your Dawnloader device"}</strong><span>{device.platform} · Added {device.created_at ? new Date(device.created_at).toLocaleDateString() : "date unavailable"}</span><small>{device.revoked ? "Access revoked" : "Last active: " + (device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : "Not reported yet")}</small></div>
+                      {device.revoked ? <span className="device-revoked">Revoked</span> : <button className="text-danger" disabled={working} onClick={() => void revokeDevice(device.id)}>Disconnect</button>}
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
 
             <div className="sync-setting">
               <div><strong>Sync download history</strong><p>Only metadata is synced. Songs, videos, and files remain on your devices by default.</p></div>

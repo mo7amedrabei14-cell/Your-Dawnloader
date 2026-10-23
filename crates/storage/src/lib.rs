@@ -612,6 +612,32 @@ impl Storage {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn list_devices(&self, user_id: Uuid) -> Result<Vec<serde_json::Value>, StorageError> {
+        let mut tx = self.begin_user_transaction(user_id).await?;
+        let rows = sqlx::query(
+            "SELECT id, device_label, platform,
+                    to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                    to_char(last_seen_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS last_seen_at,
+                    revoked_at IS NOT NULL AS revoked
+             FROM user_devices WHERE owner_user_id=$1
+             ORDER BY (revoked_at IS NOT NULL) ASC, last_seen_at DESC NULLS LAST, created_at DESC"
+        )
+        .bind(user_id).fetch_all(&mut *tx).await?;
+        let mut devices = Vec::with_capacity(rows.len());
+        for row in rows {
+            devices.push(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id")?,
+                "label": row.try_get::<Option<String>, _>("device_label")?,
+                "platform": row.try_get::<String, _>("platform")?,
+                "created_at": row.try_get::<Option<String>, _>("created_at")?,
+                "last_seen_at": row.try_get::<Option<String>, _>("last_seen_at")?,
+                "revoked": row.try_get::<bool, _>("revoked")?
+            }));
+        }
+        tx.commit().await?;
+        Ok(devices)
+    }
+
     /// Permanently deletes the account and dependent cloud metadata via declared foreign-key cascades.
     /// The caller must pass the user ID resolved from the active verified session.
     pub async fn delete_account(&self, user_id: Uuid) -> Result<bool, StorageError> {

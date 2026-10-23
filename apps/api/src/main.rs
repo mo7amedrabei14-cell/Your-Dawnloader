@@ -725,6 +725,31 @@ async fn upsert_download(
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response_serialization_failed"))
 }
 
+async fn list_account_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (_, user) = authenticate(&state, &headers).await?;
+    let devices = state.storage.list_devices(user.user_id).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_list_failed"))?;
+    Ok(Json(json!({"devices": devices})))
+}
+
+async fn revoke_account_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<Value>)> {
+    let (session, user) = authenticate(&state, &headers).await?;
+    check_csrf(&state, &headers, &session).await?;
+    let device_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "device_not_found"))?;
+    let revoked = state.storage.revoke_device(user.user_id, device_id).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "device_revoke_failed"))?;
+    if revoked { Ok(StatusCode::NO_CONTENT) }
+    else { Err(api_error(StatusCode::NOT_FOUND, "device_not_found")) }
+}
+
 async fn delete_download(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -848,6 +873,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/csrf", get(csrf))
         .route("/api/v1/me", get(me).delete(delete_account))
         .route("/api/v1/me/export", get(export_account))
+        .route("/api/v1/me/devices", get(list_account_devices))
+        .route("/api/v1/me/devices/{id}", delete(revoke_account_device))
         .route("/api/v1/me/preferences", put(update_preferences))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/downloads", get(list_downloads).post(upsert_download).delete(clear_downloads))
@@ -861,4 +888,26 @@ async fn main() -> anyhow::Result<()> {
     info!(%address, "Your Dawnloader API started with OIDC and per-account download history enabled");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod account_security_tests {
+    use super::*;
+
+    #[test]
+    fn return_to_is_limited_to_known_account_pages() {
+        assert_eq!(validated_return_to(Some("/account/connect?user_code=ABCD-EFGH")), "/account/connect?user_code=ABCD-EFGH");
+        assert_eq!(validated_return_to(Some("/account/downloads")), "/account/downloads");
+        assert_eq!(validated_return_to(Some("//evil.example/path")), "/account/downloads");
+        assert_eq!(validated_return_to(Some("https://evil.example/")), "/account/downloads");
+        assert_eq!(validated_return_to(Some("/account/delete")), "/account/downloads");
+    }
+
+    #[test]
+    fn device_code_normalization_rejects_ambiguous_characters() {
+        assert_eq!(normalize_user_code("ABCD-EFGH"), Some("ABCDEFGH".to_owned()));
+        assert_eq!(normalize_user_code("ABCD EFGH"), Some("ABCDEFGH".to_owned()));
+        assert!(normalize_user_code("ABCD-IOGH").is_none());
+        assert!(normalize_user_code("short").is_none());
+    }
 }

@@ -6,12 +6,8 @@ export const metadata: Metadata = {
   description: "Approve a Your Dawnloader desktop device to sync download-history metadata to your account.",
 };
 
-export default async function ConnectDevicePage({
-  searchParams,
-}: {
-  searchParams: Promise<{ user_code?: string | string[] }>;
-}) {
-  const params = await searchParams;
-  const code = Array.isArray(params.user_code) ? params.user_code[0] : params.user_code;
-  return <ConnectDeviceClient initialCode={code || ""} />;
+// Keep this route statically exportable for GitHub Pages. The device code is
+// read by the client from the query string after hydration.
+export default function ConnectDevicePage() {
+  return <ConnectDeviceClient initialCode="" />;
 }

@@ -12,7 +12,6 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Semaphore, mpsc, OnceCell};
 use tokio_util::sync::CancellationToken;
-use url::Url;
 use uuid::Uuid;
 
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;

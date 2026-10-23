@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn filename_is_sanitized() {
         assert_eq!(sanitize_filename("../../evil.mp4"), "_.._evil.mp4");
-        assert_eq!(sanitize_filename("C:\\Users\\name.mp3"), "C__Users__name.mp3");
+        assert_eq!(sanitize_filename("C:\\Users\\name.mp3"), "C__Users_name.mp3");
         assert_eq!(sanitize_filename("..."), "download.bin");
         assert!(sanitize_filename(&"a".repeat(300)).chars().count() <= MAX_FILENAME_CHARS);
     }

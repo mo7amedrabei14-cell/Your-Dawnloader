@@ -409,9 +409,20 @@ async fn poll_account_link(
         return Err("The account service returned an unknown device-link status.".to_owned());
     }
 
-    // This bearer credential is returned only to Rust and persisted only in the OS keychain.
+    // Drop any pending entries from a previous account before associating this local queue
+    // with the newly approved device. The active bearer credential never leaves Rust.
+    let store = state.store().await?;
+    store.clear_sync_outbox().await
+        .map_err(|_| "Could not reset the pending history queue for this account.".to_owned())?;
     AppState::save_device_token(&pending.device_code)?;
     if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
+
+    // Only backfill previously downloaded metadata if this account explicitly opted in.
+    if wire.sync_download_history.unwrap_or(false) {
+        store.queue_all_history_for_sync().await
+            .map_err(|_| "The device is connected, but existing local history could not be queued for sync.".to_owned())?;
+        let _ = state.sync_pending_downloads().await;
+    }
     Ok(DeviceLinkPollResponse {
         status: "authorized".to_owned(),
         display_name: wire.display_name,
@@ -429,7 +440,11 @@ fn cancel_account_link(state: State<'_, AppState>, link_id: String) -> Result<bo
 }
 
 async fn fetch_linked_account(state: &AppState) -> Result<Option<LinkedAccountResponse>, String> {
-    let Some(token) = state.device_token()? else { return Ok(None) };
+    let Some(token) = state.device_token()? else {
+        // Never carry one account's pending history into a later device pairing.
+        let _ = state.store().await?.clear_sync_outbox().await;
+        return Ok(None);
+    };
     let response = state.api_client
         .get(format!("{}/api/v1/device/me", state.api_base_url))
         .bearer_auth(&token)
@@ -437,6 +452,7 @@ async fn fetch_linked_account(state: &AppState) -> Result<Option<LinkedAccountRe
         .map_err(|_| "Could not verify the connected account. Check the network and try again.".to_owned())?;
     if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
         let _ = AppState::clear_device_token();
+        let _ = state.store().await?.clear_sync_outbox().await;
         return Ok(None);
     }
     if !response.status().is_success() {
@@ -477,8 +493,15 @@ async fn set_account_sync(
     if !response.status().is_success() {
         return Err("The account service rejected the preference change.".to_owned());
     }
-    if !enabled {
-        state.store().await?.clear_sync_outbox().await
+    let store = state.store().await?;
+    if enabled {
+        // Explicit opt-in also includes older local records, not only new downloads.
+        store.queue_all_history_for_sync().await
+            .map_err(|_| "History sync is enabled, but existing local records could not be queued.".to_owned())?;
+        // Keep queued rows for retry if temporarily offline; the one-minute worker will retry.
+        let _ = state.sync_pending_downloads().await;
+    } else {
+        store.clear_sync_outbox().await
             .map_err(|_| "Cloud history sync is off, but the local retry queue could not be cleared.".to_owned())?;
     }
     fetch_linked_account(state.inner()).await?
@@ -487,7 +510,11 @@ async fn set_account_sync(
 
 #[tauri::command]
 async fn disconnect_account(state: State<'_, AppState>) -> Result<bool, String> {
-    let Some(token) = state.device_token()? else { return Ok(false) };
+    let Some(token) = state.device_token()? else {
+        state.store().await?.clear_sync_outbox().await
+            .map_err(|_| "The local history-sync queue could not be cleared.".to_owned())?;
+        return Ok(false);
+    };
     let response = state.api_client
         .post(format!("{}/api/v1/device/disconnect", state.api_base_url))
         .bearer_auth(&token)
@@ -498,6 +525,8 @@ async fn disconnect_account(state: State<'_, AppState>) -> Result<bool, String> 
         return Err("The account service could not disconnect this device.".to_owned());
     }
     AppState::clear_device_token()?;
+    state.store().await?.clear_sync_outbox().await
+        .map_err(|_| "Device disconnected, but the local retry queue could not be cleared.".to_owned())?;
     Ok(true)
 }
 

@@ -277,18 +277,68 @@ impl LocalStore {
         Ok(result.rows_affected())
     }
 
+    /// Queue every existing local record for account-history sync.
+    /// SQL copies only metadata columns and never reads or queues local file paths.
+    pub async fn queue_all_history_for_sync(&self) -> Result<u64, LocalStoreError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let queued_at_unix_ms = now.min(i64::MAX as u128) as i64;
+        let result = sqlx::query(
+            "INSERT INTO download_sync_outbox
+             (record_id, source_domain, display_name, media_kind, container, completed_at_unix_ms, queued_at_unix_ms, attempts)
+             SELECT id,
+                    substr(trim(source_domain), 1, 253),
+                    substr(trim(title), 1, 300),
+                    CASE
+                      WHEN media_kind IN ('audio','video','image','document') THEN media_kind
+                      ELSE 'unknown'
+                    END,
+                    CASE WHEN format IS NULL THEN NULL ELSE substr(format, 1, 32) END,
+                    max(completed_at_unix_ms, 0),
+                    ?,
+                    0
+             FROM download_history
+             WHERE length(trim(source_domain)) > 0 AND length(trim(title)) > 0
+             ON CONFLICT(record_id) DO UPDATE SET
+               source_domain=excluded.source_domain,
+               display_name=excluded.display_name,
+               media_kind=excluded.media_kind,
+               container=excluded.container,
+               completed_at_unix_ms=excluded.completed_at_unix_ms,
+               queued_at_unix_ms=excluded.queued_at_unix_ms,
+               attempts=0"
+        )
+        .bind(queued_at_unix_ms)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Removes only the history record; the media file on disk is never deleted here.
     pub async fn delete_record(&self, id: Uuid) -> Result<bool, LocalStoreError> {
+        let mut transaction = self.pool.begin().await?;
+        // Delete the pending sync entry first so the user's removal cannot be uploaded later.
+        sqlx::query("DELETE FROM download_sync_outbox WHERE record_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await?;
         let result = sqlx::query("DELETE FROM download_history WHERE id = ?")
             .bind(id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Clears the history database only. Downloaded files remain untouched.
+    /// Clears local history and its pending cloud-sync queue atomically. Media files are untouched.
     pub async fn clear_history(&self) -> Result<u64, LocalStoreError> {
-        let result = sqlx::query("DELETE FROM download_history").execute(&self.pool).await?;
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("DELETE FROM download_sync_outbox")
+            .execute(&mut *transaction)
+            .await?;
+        let result = sqlx::query("DELETE FROM download_history")
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
         Ok(result.rows_affected())
     }
 }

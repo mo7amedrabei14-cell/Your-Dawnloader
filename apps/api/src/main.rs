@@ -127,12 +127,11 @@ impl JwksCache {
     async fn key(&self, kid: &str) -> anyhow::Result<Jwk> {
         {
             let guard = self.cached.read().await;
-            if let Some((fetched_at, jwks)) = guard.as_ref() {
-                if fetched_at.elapsed() < Duration::from_secs(300) {
-                    if let Some(key) = jwks.find(kid) {
-                        return Ok(key.clone());
-                    }
-                }
+            if let Some((fetched_at, jwks)) = guard.as_ref()
+                && fetched_at.elapsed() < Duration::from_secs(300)
+                && let Some(key) = jwks.find(kid)
+            {
+                return Ok(key.clone());
             }
         }
 
@@ -510,12 +509,16 @@ async fn csrf(
         let session_hash = sha256_hex(&session);
         let identity = state.storage.session_identity(&session_hash).await
             .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_lookup_failed"))?;
+        let valid = if identity.is_some() {
+            state.storage.validate_session_csrf(&session_hash, &sha256_hex(&token)).await
+                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "csrf_validation_failed"))?
+        } else {
+            false
+        };
+        if valid {
+            return Ok((StatusCode::OK, Json(json!({"csrf_token": token}))).into_response());
+        }
         if identity.is_some() {
-            let valid = state.storage.validate_session_csrf(&session_hash, &sha256_hex(&token)).await
-                .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "csrf_validation_failed"))?;
-            if valid {
-                return Ok((StatusCode::OK, Json(json!({"csrf_token": token}))).into_response());
-            }
             return Err(api_error(StatusCode::FORBIDDEN, "csrf_token_expired"));
         }
     }

@@ -59,12 +59,11 @@ pub struct LocalStore {
 impl LocalStore {
     pub async fn open(path: &Path) -> Result<Self, LocalStoreError> {
         let in_memory = path == Path::new(":memory:");
-        if !in_memory {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+        if !in_memory
+            && let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         let mut options = SqliteConnectOptions::new()
             .create_if_missing(true)

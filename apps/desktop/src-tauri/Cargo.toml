@@ -6,7 +6,7 @@ version = "0.1.0"
 description = "Your Dawnloader desktop application"
 authors = ["Your Dawnloader contributors"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.90"
 
 [lib]
 name = "your_dawnloader_desktop_lib"
@@ -21,8 +21,13 @@ dawn-detection = { path = "../../../crates/detection" }
 dawn-security = { path = "../../../crates/security" }
 dawn-downloader = { path = "../../../crates/downloader" }
 dawn-local-storage = { path = "../../../crates/local-storage" }
-serde = { version = "1", features = ["derive"] }
+dawn-api-contract = { path = "../../../crates/api-contract" }
+keyring.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tauri = { version = "2" }
+tauri-plugin-opener = "2.7.2"
 tokio = { version = "1", features = ["sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 url = { version = "2", features = ["serde"] }

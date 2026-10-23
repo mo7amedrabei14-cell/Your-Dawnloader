@@ -1,0 +1,16 @@
+{
+  "name": "@your-dawnloader/extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "wxt": "^0.20.0"
+  }
+}

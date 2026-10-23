@@ -445,7 +445,19 @@ mod tests {
         assert!(store.delete_record(id).await.unwrap());
         assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
 
+        let second_id = Uuid::new_v4();
+        store.record_completed(NewLocalDownloadRecord {
+            id: second_id,
+            title: "Second pending track".to_owned(),
+            source_domain: "media.example.test".to_owned(),
+            media_kind: "audio".to_owned(),
+            format: Some("mp3".to_owned()),
+            file_name: "Second pending track.mp3".to_owned(),
+            local_path: PathBuf::from("/private/second-pending.mp3"),
+            size_bytes: 10,
+        }).await.unwrap();
         store.queue_all_history_for_sync().await.unwrap();
+        assert_eq!(store.list_sync_outbox(10).await.unwrap().len(), 1);
         assert_eq!(store.clear_history().await.unwrap(), 1);
         assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
     }

@@ -415,14 +415,15 @@ async fn poll_account_link(
     store.clear_sync_outbox().await
         .map_err(|_| "Could not reset the pending history queue for this account.".to_owned())?;
     AppState::save_device_token(&pending.device_code)?;
-    if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
 
-    // Only backfill previously downloaded metadata if this account explicitly opted in.
+    // If backfill fails, preserve the pending in-memory link so a later poll can retry it.
+    // Never report the pairing complete while silently skipping opted-in local history.
     if wire.sync_download_history.unwrap_or(false) {
         store.queue_all_history_for_sync().await
-            .map_err(|_| "The device is connected, but existing local history could not be queued for sync.".to_owned())?;
+            .map_err(|_| "The device is connected, but existing local history could not be queued for sync. Retrying…".to_owned())?;
         let _ = state.sync_pending_downloads().await;
     }
+    if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
     Ok(DeviceLinkPollResponse {
         status: "authorized".to_owned(),
         display_name: wire.display_name,

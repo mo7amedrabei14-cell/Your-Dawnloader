@@ -398,6 +398,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn backfill_queues_all_local_history_without_paths() {
+        let store = LocalStore::open(Path::new(":memory:")).await.unwrap();
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+        for (id, title, domain, media_kind, format) in [
+            (first_id, "Track one", "audio.example.test", "audio", Some("mp3")),
+            (second_id, "Clip two", "video.example.test", "video", Some("mp4")),
+        ] {
+            store.record_completed(NewLocalDownloadRecord {
+                id,
+                title: title.to_owned(),
+                source_domain: domain.to_owned(),
+                media_kind: media_kind.to_owned(),
+                format: format.map(str::to_owned),
+                file_name: title.to_owned(),
+                local_path: PathBuf::from(format!("/private/{title}")),
+                size_bytes: 1,
+            }).await.unwrap();
+        }
+
+        assert_eq!(store.queue_all_history_for_sync().await.unwrap(), 2);
+        let queued = store.list_sync_outbox(10).await.unwrap();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().any(|item| item.id == first_id.to_string() && item.display_name == "Track one"));
+        assert!(queued.iter().any(|item| item.id == second_id.to_string() && item.display_name == "Clip two"));
+        assert!(!format!("{queued:?}").contains("/private/"));
+    }
+
+    #[tokio::test]
+    async fn removing_local_history_removes_pending_sync_atomically() {
+        let store = LocalStore::open(Path::new(":memory:")).await.unwrap();
+        let id = Uuid::new_v4();
+        store.record_completed(NewLocalDownloadRecord {
+            id,
+            title: "Pending track".to_owned(),
+            source_domain: "media.example.test".to_owned(),
+            media_kind: "audio".to_owned(),
+            format: Some("mp3".to_owned()),
+            file_name: "Pending track.mp3".to_owned(),
+            local_path: PathBuf::from("/private/pending.mp3"),
+            size_bytes: 10,
+        }).await.unwrap();
+        store.queue_all_history_for_sync().await.unwrap();
+        assert_eq!(store.list_sync_outbox(10).await.unwrap().len(), 1);
+        assert!(store.delete_record(id).await.unwrap());
+        assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
+
+        store.queue_all_history_for_sync().await.unwrap();
+        assert_eq!(store.clear_history().await.unwrap(), 1);
+        assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn deleting_history_never_deletes_the_media_file() {
         let store = LocalStore::open(Path::new(":memory:")).await.unwrap();
         let record_id = Uuid::new_v4();

@@ -203,11 +203,17 @@ impl AppState {
                 status: SyncedDownloadStatus::Completed,
                 completed_at_unix_ms: Some(queued_record.completed_at_unix_ms),
             };
-            let response = self.api_client
+            let response = match self.api_client
                 .post(format!("{}/api/v1/device/downloads", self.api_base_url))
                 .bearer_auth(&token)
-                .json(&request).send().await
-                .map_err(|_| "Download saved locally; one or more history records remain queued for retry.".to_owned())?;
+                .json(&request)
+                .send().await {
+                    Ok(response) => response,
+                    Err(_) => {
+                        let _ = store.increment_sync_outbox_attempt(&queued_record.id).await;
+                        return Err("Download saved locally; one or more history records remain queued for retry.".to_owned());
+                    }
+                };
             if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
                 let _ = Self::clear_device_token();
                 let _ = store.clear_sync_outbox().await;

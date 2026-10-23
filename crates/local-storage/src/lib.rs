@@ -239,11 +239,18 @@ impl LocalStore {
     }
 
     pub async fn list_sync_outbox(&self, limit: u32) -> Result<Vec<PendingSyncOutboxRecord>, LocalStoreError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let now_ms = now.min(i64::MAX as u128) as i64;
         let rows = sqlx::query(
             "SELECT record_id, source_domain, display_name, media_kind, container, completed_at_unix_ms, attempts
-             FROM download_sync_outbox ORDER BY queued_at_unix_ms ASC LIMIT ?"
+             FROM download_sync_outbox
+             WHERE queued_at_unix_ms <= ?
+             ORDER BY queued_at_unix_ms ASC, record_id ASC
+             LIMIT ?"
         )
-        .bind(i64::from(limit.clamp(1, 250))).fetch_all(&self.pool).await?;
+        .bind(now_ms)
+        .bind(i64::from(limit.clamp(1, 250)))
+        .fetch_all(&self.pool).await?;
         let mut records = Vec::with_capacity(rows.len());
         for row in rows {
             let attempts: i64 = row.try_get("attempts")?;
@@ -260,9 +267,29 @@ impl LocalStore {
         Ok(records)
     }
 
+    /// Move a failing record to a future retry slot using capped exponential backoff.
+    /// A malformed/unavailable item therefore cannot block newer queue entries.
     pub async fn increment_sync_outbox_attempt(&self, record_id: &str) -> Result<(), LocalStoreError> {
-        sqlx::query("UPDATE download_sync_outbox SET attempts=attempts+1 WHERE record_id=?")
-            .bind(record_id).execute(&self.pool).await?;
+        let attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM download_sync_outbox WHERE record_id=?"
+        )
+        .bind(record_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(attempts) = attempts else { return Ok(()) };
+        let exponent = attempts.clamp(0, 7) as u32;
+        let delay_ms = 30_000_i64.saturating_mul(1_i64 << exponent).min(3_600_000);
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let retry_at_ms = (now.min(i64::MAX as u128) as i64).saturating_add(delay_ms);
+        sqlx::query(
+            "UPDATE download_sync_outbox
+             SET attempts=attempts+1, queued_at_unix_ms=?
+             WHERE record_id=?"
+        )
+        .bind(retry_at_ms)
+        .bind(record_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -392,7 +419,11 @@ mod tests {
         assert_eq!(queued[0].attempts, 0);
         assert!(!format!("{:?}", queued[0]).contains("local_path"));
         store.increment_sync_outbox_attempt(&queued[0].id).await.unwrap();
-        assert_eq!(store.list_sync_outbox(10).await.unwrap()[0].attempts, 1);
+        assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
+        let stored_attempts = sqlx::query_scalar::<_, i64>(
+            "SELECT attempts FROM download_sync_outbox WHERE record_id=?"
+        ).bind(id.to_string()).fetch_one(&store.pool).await.unwrap();
+        assert_eq!(stored_attempts, 1);
         assert!(store.remove_sync_outbox_record(&id.to_string()).await.unwrap());
         assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
     }

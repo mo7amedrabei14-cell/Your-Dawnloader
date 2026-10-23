@@ -41,7 +41,7 @@ pub struct DeviceIdentity {
 #[derive(Debug, Clone)]
 pub enum DeviceLinkStatus {
     Pending,
-    Authorized(DeviceIdentity),
+    Authorized(Box<DeviceIdentity>),
     Expired,
     Revoked,
 }
@@ -533,7 +533,7 @@ impl Storage {
         }
         if approved && owner_user_id.is_some() {
             return Ok(match self.device_identity(device_code_hash).await? {
-                Some(identity) => Some(DeviceLinkStatus::Authorized(identity)),
+                Some(identity) => Some(DeviceLinkStatus::Authorized(Box::new(identity))),
                 None => Some(DeviceLinkStatus::Revoked),
             });
         }

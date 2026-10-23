@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 type Inspection = {
   host: string;
@@ -38,6 +39,28 @@ type LocalDownloadRecord = {
   file_exists: boolean;
 };
 
+type LinkedAccount = {
+  connected: boolean;
+  display_name: string | null;
+  email: string | null;
+  sync_download_history: boolean;
+};
+type DeviceLinkStart = {
+  link_id: string;
+  user_code: string;
+  verification_url: string;
+  expires_in_seconds: number;
+  interval_seconds: number;
+};
+type DeviceLinkStatus = {
+  status: "pending" | "authorized" | "expired";
+  display_name: string | null;
+  email: string | null;
+  sync_download_history: boolean | null;
+  device_label: string | null;
+};
+type PairingState = DeviceLinkStart;
+
 function formatBytes(value: number): string {
   if (value < 1024) return value + " B";
   const units = ["KB", "MB", "GB", "TB"];
@@ -69,6 +92,10 @@ export default function App() {
   const [tasks, setTasks] = useState<ActiveDownload[]>([]);
   const [records, setRecords] = useState<LocalDownloadRecord[]>([]);
   const [historyError, setHistoryError] = useState("");
+  const [account, setAccount] = useState<LinkedAccount | null>(null);
+  const [accountError, setAccountError] = useState("");
+  const [accountBusy, setAccountBusy] = useState(false);
+  const [pairing, setPairing] = useState<PairingState | null>(null);
 
   async function loadHistory() {
     try {
@@ -76,6 +103,15 @@ export default function App() {
       setRecords(await invoke<LocalDownloadRecord[]>("list_downloads"));
     } catch (caught) {
       setHistoryError(typeof caught === "string" ? caught : "Could not load local download history.");
+    }
+  }
+
+  async function loadAccount() {
+    try {
+      setAccountError("");
+      setAccount(await invoke<LinkedAccount | null>("get_account_status"));
+    } catch (caught) {
+      setAccountError(typeof caught === "string" ? caught : "Could not check account connection.");
     }
   }
 
@@ -109,11 +145,107 @@ export default function App() {
     });
 
     void loadHistory();
+    void loadAccount();
     return () => {
       active = false;
       unlisten?.();
     };
   }, []);
+
+  async function connectAccount() {
+    setAccountBusy(true); setAccountError("");
+    try {
+      const link = await invoke<DeviceLinkStart>("start_account_link");
+      setPairing(link);
+      try {
+        await openUrl(link.verification_url);
+      } catch {
+        setAccountError("The approval page could not be opened automatically. Use the URL shown below.");
+      }
+    } catch (caught) {
+      setAccountError(typeof caught === "string" ? caught : "Could not start account connection.");
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function openApprovalPage() {
+    if (!pairing) return;
+    try {
+      await openUrl(pairing.verification_url);
+    } catch {
+      setAccountError("Could not open the verification URL. Copy it into your browser manually.");
+    }
+  }
+
+  async function toggleAccountSync() {
+    if (!account) return;
+    setAccountBusy(true); setAccountError("");
+    try {
+      const updated = await invoke<LinkedAccount>("set_account_sync", {
+        enabled: !account.sync_download_history,
+      });
+      setAccount(updated);
+    } catch (caught) {
+      setAccountError(typeof caught === "string" ? caught : "Could not update cloud history sync.");
+      await loadAccount();
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  async function disconnectAccount() {
+    setAccountBusy(true); setAccountError("");
+    try {
+      await invoke<boolean>("disconnect_account");
+      setAccount(null);
+    } catch (caught) {
+      setAccountError(typeof caught === "string" ? caught : "Could not disconnect the account.");
+    } finally {
+      setAccountBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!pairing) return;
+    let cancelled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    const poll = async () => {
+      try {
+        const status = await invoke<DeviceLinkStatus>("poll_account_link", { linkId: pairing.link_id });
+        if (cancelled) return;
+        if (status.status === "authorized") {
+          setAccount({
+            connected: true,
+            display_name: status.display_name,
+            email: status.email,
+            sync_download_history: status.sync_download_history ?? false,
+          });
+          setPairing(null);
+          setAccountError("");
+          return;
+        }
+        if (status.status === "expired") {
+          setPairing(null);
+          setAccountError("This connection code expired. Start a new connection and approve it within 10 minutes.");
+          return;
+        }
+        timeout = setTimeout(poll, pairing.interval_seconds * 1000);
+      } catch (caught) {
+        if (cancelled) return;
+        setAccountError(typeof caught === "string" ? caught : "Could not check approval. The app will keep retrying.");
+        timeout = setTimeout(poll, pairing.interval_seconds * 1000);
+      }
+    };
+
+    timeout = setTimeout(poll, pairing.interval_seconds * 1000);
+    return () => {
+      cancelled = true;
+      if (timeout) clearTimeout(timeout);
+      void invoke<boolean>("cancel_account_link", { linkId: pairing.link_id }).catch(() => undefined);
+    };
+  }, [pairing?.link_id]);
 
   async function inspect() {
     setError("");
@@ -176,9 +308,39 @@ export default function App() {
             <button className={activeView === "new" ? "selected" : ""} onClick={() => setActiveView("new")}>New</button>
             <button className={activeView === "downloads" ? "selected" : ""} onClick={() => { setActiveView("downloads"); void loadHistory(); }}>My Downloads</button>
           </nav>
-          <div className="account-chip"><span className="status-dot" /> Local mode</div>
+          {account ? (
+            <div className="account-tools">
+              <div className="account-chip"><span className="status-dot" /><span>{account.display_name || account.email || "Connected account"}</span></div>
+              <button className={account.sync_download_history ? "sync-pill enabled" : "sync-pill"} onClick={() => void toggleAccountSync()} disabled={accountBusy} title="Toggle cloud download-history sync">
+                Sync {account.sync_download_history ? "on" : "off"}
+              </button>
+              <button className="text-button" onClick={() => void disconnectAccount()} disabled={accountBusy}>Disconnect</button>
+            </div>
+          ) : (
+            <button className="connect-button" onClick={() => void connectAccount()} disabled={accountBusy || !!pairing}>
+              {accountBusy ? "Connecting…" : "Connect account ↗"}
+            </button>
+          )}
         </div>
       </header>
+
+      {accountError && <p className="notice error account-notice" role="alert">{accountError}</p>}
+      {pairing && (
+        <section className="pairing-panel" aria-live="polite">
+          <div className="pairing-copy">
+            <p className="eyebrow">APPROVE THIS DEVICE</p>
+            <h2>Finish connecting your account</h2>
+            <p>Sign in on the page that opened and approve only if this code matches the one shown here.</p>
+            <div className="pairing-code">{pairing.user_code}</div>
+            <small>Expires in about {Math.max(1, Math.ceil(pairing.expires_in_seconds / 60))} minutes · checking every {pairing.interval_seconds} seconds</small>
+            <div className="pairing-actions">
+              <button className="download-now" onClick={() => void openApprovalPage()}>Open approval page ↗</button>
+              <button className="text-button" onClick={() => setPairing(null)}>Cancel</button>
+            </div>
+            <a className="pairing-url" href={pairing.verification_url} onClick={(event) => { event.preventDefault(); void openApprovalPage(); }}>{pairing.verification_url}</a>
+          </div>
+        </section>
+      )}
 
       {activeView === "new" ? (
         <>
@@ -259,14 +421,14 @@ export default function App() {
               ))}
             </div>
           )}
-          <p className="privacy-note">This is local device history. The account-based cloud library and cross-device metadata sync are not connected yet.</p>
+          <p className="privacy-note">This is the history saved on this device. Connect an account and enable sync to send metadata to My Downloads on the website; the media files stay local.</p>
         </section>
       )}
 
       <section className="feature-grid" aria-label="Product areas">
         <article className="feature-card"><span className="feature-icon">↧</span><div><h2>Direct downloads</h2><p>Bounded streaming, progress, cancellation, and safe local history for direct files.</p><span className="state-label">EARLY ENGINE</span></div></article>
         <article className="feature-card"><span className="feature-icon">◉</span><div><h2>Browser capture</h2><p>Find eligible media candidates with an explicit user action and minimal permissions.</p><span className="state-label">EXTENSION FOUNDATION</span></div></article>
-        <article className="feature-card"><span className="feature-icon">◎</span><div><h2>Account library</h2><p>Account history will sync metadata only when the user signs in and opts in.</p><span className="state-label">AUTHENTICATION PENDING</span></div></article>
+        <article className="feature-card"><span className="feature-icon">◎</span><div><h2>Account library</h2><p>Connect this device and opt in to sync download metadata to your website account.</p><span className="state-label">{account ? (account.sync_download_history ? "ACCOUNT CONNECTED · SYNC ON" : "ACCOUNT CONNECTED · LOCAL ONLY") : "OPTIONAL DEVICE LINK"}</span></div></article>
       </section>
       <footer><span>LOCAL-FIRST BY DESIGN</span><span>Direct media detection does not imply download permission.</span></footer>
     </main>

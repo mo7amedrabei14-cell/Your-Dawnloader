@@ -82,10 +82,14 @@ impl Storage {
              RETURNING nonce, pkce_verifier"
         )
         .bind(state_hash).fetch_optional(&self.pool).await?;
-        row.map(|row| Ok(LoginState {
-            nonce: row.try_get("nonce")?,
-            pkce_verifier: row.try_get("pkce_verifier")?,
-        })).transpose().map_err(StorageError::from)
+        if let Some(row) = row {
+            Ok(Some(LoginState {
+                nonce: row.try_get::<String, _>("nonce")?,
+                pkce_verifier: row.try_get::<String, _>("pkce_verifier")?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn upsert_oidc_user(
@@ -172,16 +176,20 @@ impl Storage {
                AND s.revoked_at IS NULL AND s.expires_at > now()"
         )
         .bind(session_token_hash).bind(owner_user_id).fetch_optional(&mut *tx).await?;
-        let identity = row.map(|row| Ok(SessionIdentity {
-            user_id: row.try_get("user_id")?,
-            issuer: row.try_get("issuer")?,
-            subject: row.try_get("subject")?,
-            email: row.try_get("email")?,
-            email_verified: row.try_get("email_verified")?,
-            display_name: row.try_get("display_name")?,
-            locale: row.try_get("locale")?,
-            sync_download_history: row.try_get("sync_download_history")?,
-        })).transpose()?;
+        let identity = if let Some(row) = row {
+            Some(SessionIdentity {
+                user_id: row.try_get("user_id")?,
+                issuer: row.try_get("issuer")?,
+                subject: row.try_get("subject")?,
+                email: row.try_get("email")?,
+                email_verified: row.try_get("email_verified")?,
+                display_name: row.try_get("display_name")?,
+                locale: row.try_get("locale")?,
+                sync_download_history: row.try_get("sync_download_history")?,
+            })
+        } else {
+            None
+        };
         tx.commit().await?;
         Ok(identity)
     }

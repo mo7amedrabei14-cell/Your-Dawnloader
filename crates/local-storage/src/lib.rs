@@ -36,6 +36,27 @@ pub struct NewLocalDownloadRecord {
     pub size_bytes: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewSyncOutboxRecord {
+    pub id: Uuid,
+    pub source_domain: String,
+    pub display_name: String,
+    pub media_kind: String,
+    pub container: Option<String>,
+    pub completed_at_unix_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingSyncOutboxRecord {
+    pub id: String,
+    pub source_domain: String,
+    pub display_name: String,
+    pub media_kind: String,
+    pub container: Option<String>,
+    pub completed_at_unix_ms: i64,
+    pub attempts: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalDownloadRecord {
     pub id: String,
@@ -101,6 +122,21 @@ impl LocalStore {
         sqlx::query("CREATE INDEX IF NOT EXISTS download_history_completed_idx ON download_history(completed_at_unix_ms DESC)")
             .execute(&pool)
             .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS download_sync_outbox (
+                record_id TEXT PRIMARY KEY NOT NULL,
+                source_domain TEXT NOT NULL CHECK(length(source_domain) BETWEEN 1 AND 253),
+                display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 300),
+                media_kind TEXT NOT NULL CHECK(media_kind IN ('audio','video','image','document','unknown')),
+                container TEXT CHECK(container IS NULL OR length(container) <= 32),
+                completed_at_unix_ms INTEGER NOT NULL,
+                queued_at_unix_ms INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0)
+            )"
+        ).execute(&pool).await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS download_sync_outbox_queued_idx ON download_sync_outbox(queued_at_unix_ms ASC)")
+            .execute(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -175,6 +211,72 @@ impl LocalStore {
             .map_err(LocalStoreError::Database)
     }
 
+    /// Durable metadata-only queue for retrying cloud history sync after temporary network failure.
+    /// No local path, full source URL, credentials or media bytes are retained here.
+    pub async fn enqueue_sync_outbox(&self, record: NewSyncOutboxRecord) -> Result<(), LocalStoreError> {
+        let source_domain = bounded(&record.source_domain, 253);
+        let display_name = bounded(&record.display_name, 300);
+        let media_kind = match record.media_kind.as_str() {
+            "audio" | "video" | "image" | "document" => record.media_kind.as_str(),
+            _ => "unknown",
+        };
+        let container = record.container.as_deref().map(|value| bounded(value, 32));
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let queued_at_unix_ms = now.min(i64::MAX as u128) as i64;
+        sqlx::query(
+            "INSERT INTO download_sync_outbox
+             (record_id, source_domain, display_name, media_kind, container, completed_at_unix_ms, queued_at_unix_ms)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(record_id) DO UPDATE SET
+               source_domain=excluded.source_domain, display_name=excluded.display_name,
+               media_kind=excluded.media_kind, container=excluded.container,
+               completed_at_unix_ms=excluded.completed_at_unix_ms"
+        )
+        .bind(record.id.to_string()).bind(source_domain).bind(display_name).bind(media_kind)
+        .bind(container).bind(record.completed_at_unix_ms.max(0)).bind(queued_at_unix_ms)
+        .execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn list_sync_outbox(&self, limit: u32) -> Result<Vec<PendingSyncOutboxRecord>, LocalStoreError> {
+        let rows = sqlx::query(
+            "SELECT record_id, source_domain, display_name, media_kind, container, completed_at_unix_ms, attempts
+             FROM download_sync_outbox ORDER BY queued_at_unix_ms ASC LIMIT ?"
+        )
+        .bind(i64::from(limit.clamp(1, 250))).fetch_all(&self.pool).await?;
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            let attempts: i64 = row.try_get("attempts")?;
+            records.push(PendingSyncOutboxRecord {
+                id: row.try_get("record_id")?,
+                source_domain: row.try_get("source_domain")?,
+                display_name: row.try_get("display_name")?,
+                media_kind: row.try_get("media_kind")?,
+                container: row.try_get("container")?,
+                completed_at_unix_ms: row.try_get("completed_at_unix_ms")?,
+                attempts: attempts.max(0).min(u32::MAX as i64) as u32,
+            });
+        }
+        Ok(records)
+    }
+
+    pub async fn increment_sync_outbox_attempt(&self, record_id: &str) -> Result<(), LocalStoreError> {
+        sqlx::query("UPDATE download_sync_outbox SET attempts=attempts+1 WHERE record_id=?")
+            .bind(record_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn remove_sync_outbox_record(&self, record_id: &str) -> Result<bool, LocalStoreError> {
+        let result = sqlx::query("DELETE FROM download_sync_outbox WHERE record_id=?")
+            .bind(record_id).execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn clear_sync_outbox(&self) -> Result<u64, LocalStoreError> {
+        let result = sqlx::query("DELETE FROM download_sync_outbox").execute(&self.pool).await?;
+        Ok(result.rows_affected())
+    }
+
     /// Removes only the history record; the media file on disk is never deleted here.
     pub async fn delete_record(&self, id: Uuid) -> Result<bool, LocalStoreError> {
         let result = sqlx::query("DELETE FROM download_history WHERE id = ?")
@@ -219,6 +321,30 @@ mod tests {
         let json = serde_json::to_value(&items[0]).unwrap();
         assert!(json.get("local_path").is_none());
         assert_eq!(json["title"], "Sample track");
+    }
+
+    #[tokio::test]
+    async fn sync_outbox_persists_only_metadata_for_retry() {
+        let store = LocalStore::open(Path::new(":memory:")).await.unwrap();
+        let id = Uuid::new_v4();
+        store.enqueue_sync_outbox(NewSyncOutboxRecord {
+            id,
+            source_domain: "media.example.test".to_owned(),
+            display_name: "Sample track".to_owned(),
+            media_kind: "audio".to_owned(),
+            container: Some("mp3".to_owned()),
+            completed_at_unix_ms: 1000,
+        }).await.unwrap();
+        let queued = store.list_sync_outbox(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, id.to_string());
+        assert_eq!(queued[0].source_domain, "media.example.test");
+        assert_eq!(queued[0].attempts, 0);
+        assert!(!format!("{:?}", queued[0]).contains("local_path"));
+        store.increment_sync_outbox_attempt(&queued[0].id).await.unwrap();
+        assert_eq!(store.list_sync_outbox(10).await.unwrap()[0].attempts, 1);
+        assert!(store.remove_sync_outbox_record(&id.to_string()).await.unwrap());
+        assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
     }
 
     #[tokio::test]

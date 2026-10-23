@@ -133,55 +133,92 @@ impl AppState {
         container: Option<&str>,
         completed_at_unix_ms: i64,
     ) -> Result<(), String> {
+        // Unlinked devices remain local-only. Once linked, persist metadata before attempting the network.
+        if self.device_token()?.is_none() { return Ok(()) }
+        self.store().await?
+            .enqueue_sync_outbox(dawn_local_storage::NewSyncOutboxRecord {
+                id: record_id,
+                source_domain: source_domain.to_owned(),
+                display_name: display_name.to_owned(),
+                media_kind: media_kind.to_owned(),
+                container: container.map(str::to_owned),
+                completed_at_unix_ms,
+            })
+            .await
+            .map_err(|_| "Download saved locally, but its sync record could not be queued for retry.".to_owned())?;
+        self.sync_pending_downloads().await
+    }
+
+    async fn sync_pending_downloads(&self) -> Result<(), String> {
         let Some(token) = self.device_token()? else { return Ok(()) };
+        let store = self.store().await?;
+        let queued = store.list_sync_outbox(100).await
+            .map_err(|_| "Could not read the local history-sync queue.".to_owned())?;
+        if queued.is_empty() { return Ok(()) }
+
         let me_response = self.api_client
             .get(format!("{}/api/v1/device/me", self.api_base_url))
             .bearer_auth(&token)
             .send().await
-            .map_err(|_| "Download saved locally, but cloud history could not be checked.".to_owned())?;
+            .map_err(|_| "Download saved locally; cloud history is queued and will retry when online.".to_owned())?;
         if matches!(me_response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
             let _ = Self::clear_device_token();
-            return Err("Download saved locally. The account connection has expired or been revoked; reconnect to sync history.".to_owned());
+            let _ = store.clear_sync_outbox().await;
+            return Err("Download saved locally. The account connection expired or was revoked; reconnect to sync future history.".to_owned());
         }
         if !me_response.status().is_success() {
-            return Err("Download saved locally, but the account service did not accept the history check.".to_owned());
+            return Err("Download saved locally; cloud history is queued and will retry after the account service recovers.".to_owned());
         }
         let account: DeviceMeResponse = me_response.json().await
-            .map_err(|_| "Download saved locally, but the account response could not be read.".to_owned())?;
+            .map_err(|_| "Download saved locally; cloud history remains queued until a valid account response is available.".to_owned())?;
         if !account.user.sync_download_history {
+            store.clear_sync_outbox().await
+                .map_err(|_| "History sync is off; could not clear the local retry queue.".to_owned())?;
             return Ok(());
         }
 
-        let media_kind = match media_kind {
-            "audio" => SyncedMediaKind::Audio,
-            "video" => SyncedMediaKind::Video,
-            "image" => SyncedMediaKind::Image,
-            "document" => SyncedMediaKind::Document,
-            _ => SyncedMediaKind::Unknown,
-        };
-        let request = UpsertDownloadRecordRequest {
-            client_record_id: record_id,
-            source_domain: source_domain.to_owned(),
-            provider_item_key: None,
-            display_name: Some(display_name.to_owned()),
-            media_kind,
-            container: container.map(str::to_owned),
-            quality_label: None,
-            status: SyncedDownloadStatus::Completed,
-            completed_at_unix_ms: Some(completed_at_unix_ms),
-        };
-        let response = self.api_client
-            .post(format!("{}/api/v1/device/downloads", self.api_base_url))
-            .bearer_auth(&token)
-            .json(&request)
-            .send().await
-            .map_err(|_| "Download saved locally, but its history record could not be synced.".to_owned())?;
-        if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
-            let _ = Self::clear_device_token();
-            return Err("Download saved locally. Reconnect this device to sync future history.".to_owned());
-        }
-        if !response.status().is_success() {
-            return Err("Download saved locally, but its history record was not synced.".to_owned());
+        for queued_record in queued {
+            let id = match Uuid::parse_str(&queued_record.id) {
+                Ok(id) => id,
+                Err(_) => {
+                    let _ = store.remove_sync_outbox_record(&queued_record.id).await;
+                    continue;
+                }
+            };
+            let media_kind = match queued_record.media_kind.as_str() {
+                "audio" => SyncedMediaKind::Audio,
+                "video" => SyncedMediaKind::Video,
+                "image" => SyncedMediaKind::Image,
+                "document" => SyncedMediaKind::Document,
+                _ => SyncedMediaKind::Unknown,
+            };
+            let request = UpsertDownloadRecordRequest {
+                client_record_id: id,
+                source_domain: queued_record.source_domain.clone(),
+                provider_item_key: None,
+                display_name: Some(queued_record.display_name.clone()),
+                media_kind,
+                container: queued_record.container.clone(),
+                quality_label: None,
+                status: SyncedDownloadStatus::Completed,
+                completed_at_unix_ms: Some(queued_record.completed_at_unix_ms),
+            };
+            let response = self.api_client
+                .post(format!("{}/api/v1/device/downloads", self.api_base_url))
+                .bearer_auth(&token)
+                .json(&request).send().await
+                .map_err(|_| "Download saved locally; one or more history records remain queued for retry.".to_owned())?;
+            if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+                let _ = Self::clear_device_token();
+                let _ = store.clear_sync_outbox().await;
+                return Err("Download saved locally. Device authorization was revoked; reconnect before syncing future history.".to_owned());
+            }
+            if !response.status().is_success() {
+                let _ = store.increment_sync_outbox_attempt(&queued_record.id).await;
+                return Err("Download saved locally; one or more history records remain queued for retry.".to_owned());
+            }
+            store.remove_sync_outbox_record(&queued_record.id).await
+                .map_err(|_| "The history record synced, but its local retry marker could not be removed.".to_owned())?;
         }
         Ok(())
     }
@@ -439,6 +476,10 @@ async fn set_account_sync(
     }
     if !response.status().is_success() {
         return Err("The account service rejected the preference change.".to_owned());
+    }
+    if !enabled {
+        state.store().await?.clear_sync_outbox().await
+            .map_err(|_| "Cloud history sync is off, but the local retry queue could not be cleared.".to_owned())?;
     }
     fetch_linked_account(state.inner()).await?
         .ok_or_else(|| "Device was disconnected while updating preferences.".to_owned())
@@ -708,7 +749,14 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir)?;
             let state = AppState::new(app_data_dir.join("download-history.sqlite3"))
                 .map_err(std::io::Error::other)?;
-            app.manage(state);
+            app.manage(state.clone());
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    let _ = state.sync_pending_downloads().await;
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -16,6 +16,8 @@ uuid.workspace = true
 tower-http.workspace = true
 axum.workspace = true
 dawn-storage = { path = "../../crates/storage" }
+dawn-api-contract = { path = "../../crates/api-contract" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true

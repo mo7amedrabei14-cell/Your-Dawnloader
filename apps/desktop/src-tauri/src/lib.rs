@@ -154,7 +154,12 @@ impl AppState {
         let store = self.store().await?;
         let queued = store.list_sync_outbox(100).await
             .map_err(|_| "Could not read the local history-sync queue.".to_owned())?;
-        if queued.is_empty() { return Ok(()) }
+        // A retry may be scheduled in the future. Still check the account preference while
+        // any entry remains queued so opting out in the web app clears local pending metadata promptly.
+        if queued.is_empty() && !store.has_sync_outbox().await
+            .map_err(|_| "Could not check the local history-sync queue.".to_owned())? {
+            return Ok(());
+        }
 
         let me_response = self.api_client
             .get(format!("{}/api/v1/device/me", self.api_base_url))

@@ -269,6 +269,15 @@ impl LocalStore {
 
     /// Move a failing record to a future retry slot using capped exponential backoff.
     /// A malformed/unavailable item therefore cannot block newer queue entries.
+    pub async fn has_sync_outbox(&self) -> Result<bool, LocalStoreError> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM download_sync_outbox)"
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     pub async fn increment_sync_outbox_attempt(&self, record_id: &str) -> Result<(), LocalStoreError> {
         let attempts = sqlx::query_scalar::<_, i64>(
             "SELECT attempts FROM download_sync_outbox WHERE record_id=?"
@@ -420,6 +429,7 @@ mod tests {
         assert!(!format!("{:?}", queued[0]).contains("local_path"));
         store.increment_sync_outbox_attempt(&queued[0].id).await.unwrap();
         assert!(store.list_sync_outbox(10).await.unwrap().is_empty());
+        assert!(store.has_sync_outbox().await.unwrap());
         let stored_attempts = sqlx::query_scalar::<_, i64>(
             "SELECT attempts FROM download_sync_outbox WHERE record_id=?"
         ).bind(id.to_string()).fetch_one(&store.pool).await.unwrap();

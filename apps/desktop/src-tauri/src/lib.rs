@@ -5,7 +5,6 @@ use std::{
 };
 
 use dawn_detection::classify;
-use dawn_domain::MediaKind;
 use dawn_downloader::{DownloadError, DownloadEvent, DownloadRequest, download_direct};
 use dawn_local_storage::{LocalDownloadRecord, LocalStore, NewLocalDownloadRecord};
 use dawn_security::validate_http_url;

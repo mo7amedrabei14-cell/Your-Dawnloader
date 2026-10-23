@@ -1,38 +1,83 @@
 use std::{
     collections::HashMap,
+    env,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use dawn_api_contract::{SyncedDownloadStatus, SyncedMediaKind, UpsertDownloadRecordRequest};
 use dawn_detection::classify;
 use dawn_downloader::{DownloadError, DownloadEvent, DownloadRequest, download_direct};
 use dawn_local_storage::{LocalDownloadRecord, LocalStore, NewLocalDownloadRecord};
 use dawn_security::validate_http_url;
-use serde::Serialize;
+use keyring::Entry;
+use reqwest::{Client, StatusCode};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{Semaphore, mpsc, OnceCell};
 use tokio_util::sync::CancellationToken;
+use url::Url;
 use uuid::Uuid;
 
 const MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+const KEYRING_SERVICE: &str = "com.yourdawnloader.app";
+const KEYRING_USERNAME: &str = "approved-device-code";
+const DEFAULT_API_BASE: &str = "http://127.0.0.1:8080";
+const API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone)]
+struct PendingDeviceLink {
+    device_code: String,
+    expires_at: Instant,
+    interval_seconds: u64,
+}
 
 #[derive(Clone)]
 struct AppState {
     database_path: PathBuf,
     local_store: Arc<OnceCell<LocalStore>>,
     tasks: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pending_device_links: Arc<Mutex<HashMap<String, PendingDeviceLink>>>,
     download_slots: Arc<Semaphore>,
+    api_base_url: String,
+    api_client: Client,
 }
 
 impl AppState {
-    fn new(database_path: PathBuf) -> Self {
-        Self {
+    fn new(database_path: PathBuf) -> Result<Self, String> {
+        let raw_api_base = env::var("YOUR_DAWNLOADER_API_BASE_URL")
+            .ok()
+            .or_else(|| option_env!("YOUR_DAWNLOADER_API_BASE_URL").map(str::to_owned))
+            .unwrap_or_else(|| DEFAULT_API_BASE.to_owned());
+        let parsed_api_base = Url::parse(raw_api_base.trim())
+            .map_err(|_| "The account API URL is invalid.".to_owned())?;
+        let is_local_http = parsed_api_base.scheme() == "http"
+            && matches!(parsed_api_base.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+        if parsed_api_base.username() != ""
+            || parsed_api_base.password().is_some()
+            || parsed_api_base.host_str().is_none()
+            || !(parsed_api_base.scheme() == "https" || is_local_http) {
+            return Err("The account API must use HTTPS (HTTP is permitted only for local development).".to_owned());
+        }
+        let api_base_url = parsed_api_base.as_str().trim_end_matches('/').to_owned();
+        let api_client = Client::builder()
+            .timeout(API_REQUEST_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent("YourDawnloader-Desktop/0.1")
+            .build()
+            .map_err(|_| "Could not initialize the account network client.".to_owned())?;
+
+        Ok(Self {
             database_path,
             local_store: Arc::new(OnceCell::new()),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            pending_device_links: Arc::new(Mutex::new(HashMap::new())),
             download_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)),
-        }
+            api_base_url,
+            api_client,
+        })
     }
 
     async fn store(&self) -> Result<LocalStore, String> {
@@ -51,6 +96,94 @@ impl AppState {
         if let Ok(mut tasks) = self.tasks.lock() {
             tasks.remove(task_id);
         }
+    }
+
+    fn token_entry() -> Result<Entry, String> {
+        Entry::new(KEYRING_SERVICE, KEYRING_USERNAME)
+            .map_err(|_| "The operating-system credential store is unavailable.".to_owned())
+    }
+
+    fn device_token(&self) -> Result<Option<String>, String> {
+        match Self::token_entry()?.get_password() {
+            Ok(token) if !token.is_empty() => Ok(Some(token)),
+            Ok(_) => Ok(None),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(_) => Err("Could not read the device credential from the operating-system credential store.".to_owned()),
+        }
+    }
+
+    fn save_device_token(token: &str) -> Result<(), String> {
+        Self::token_entry()?.set_password(token)
+            .map_err(|_| "Could not save the device credential in the operating-system credential store.".to_owned())
+    }
+
+    fn clear_device_token() -> Result<(), String> {
+        match Self::token_entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(_) => Err("Could not remove the device credential from the operating-system credential store.".to_owned()),
+        }
+    }
+
+    async fn sync_completed_download(
+        &self,
+        record_id: Uuid,
+        source_domain: &str,
+        display_name: &str,
+        media_kind: &str,
+        container: Option<&str>,
+        completed_at_unix_ms: i64,
+    ) -> Result<(), String> {
+        let Some(token) = self.device_token()? else { return Ok(()) };
+        let me_response = self.api_client
+            .get(format!("{}/api/v1/device/me", self.api_base_url))
+            .bearer_auth(&token)
+            .send().await
+            .map_err(|_| "Download saved locally, but cloud history could not be checked.".to_owned())?;
+        if matches!(me_response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+            let _ = Self::clear_device_token();
+            return Err("Download saved locally. The account connection has expired or been revoked; reconnect to sync history.".to_owned());
+        }
+        if !me_response.status().is_success() {
+            return Err("Download saved locally, but the account service did not accept the history check.".to_owned());
+        }
+        let account: DeviceMeResponse = me_response.json().await
+            .map_err(|_| "Download saved locally, but the account response could not be read.".to_owned())?;
+        if !account.user.sync_download_history {
+            return Ok(());
+        }
+
+        let media_kind = match media_kind {
+            "audio" => SyncedMediaKind::Audio,
+            "video" => SyncedMediaKind::Video,
+            "image" => SyncedMediaKind::Image,
+            "document" => SyncedMediaKind::Document,
+            _ => SyncedMediaKind::Unknown,
+        };
+        let request = UpsertDownloadRecordRequest {
+            client_record_id: record_id,
+            source_domain: source_domain.to_owned(),
+            provider_item_key: None,
+            display_name: Some(display_name.to_owned()),
+            media_kind,
+            container: container.map(str::to_owned),
+            quality_label: None,
+            status: SyncedDownloadStatus::Completed,
+            completed_at_unix_ms: Some(completed_at_unix_ms),
+        };
+        let response = self.api_client
+            .post(format!("{}/api/v1/device/downloads", self.api_base_url))
+            .bearer_auth(&token)
+            .json(&request)
+            .send().await
+            .map_err(|_| "Download saved locally, but its history record could not be synced.".to_owned())?;
+        if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+            let _ = Self::clear_device_token();
+            return Err("Download saved locally. Reconnect this device to sync future history.".to_owned());
+        }
+        if !response.status().is_success() {
+            return Err("Download saved locally, but its history record was not synced.".to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -75,6 +208,256 @@ struct DownloadProgress {
 #[derive(Debug, Serialize)]
 struct StartDownloadResponse {
     task_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StartAccountLinkResponse {
+    link_id: String,
+    user_code: String,
+    verification_url: String,
+    expires_in_seconds: u64,
+    interval_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkStartWire {
+    device_code: String,
+    user_code: String,
+    verification_url: String,
+    expires_in_seconds: u64,
+    interval_seconds: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLinkPollWire {
+    status: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    sync_download_history: Option<bool>,
+    #[serde(default)]
+    device_label: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceLinkPollResponse {
+    status: String,
+    display_name: Option<String>,
+    email: Option<String>,
+    sync_download_history: Option<bool>,
+    device_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceMeResponse {
+    user: DeviceMeUser,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct DeviceMeUser {
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    sync_download_history: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct LinkedAccountResponse {
+    connected: bool,
+    display_name: Option<String>,
+    email: Option<String>,
+    sync_download_history: bool,
+}
+
+fn validate_verification_url(raw: &str, expected_user_code: &str) -> Result<String, String> {
+    let url = Url::parse(raw).map_err(|_| "The account service returned an invalid verification URL.".to_owned())?;
+    let local_http = url.scheme() == "http"
+        && matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "::1"));
+    if url.username() != ""
+        || url.password().is_some()
+        || url.host_str().is_none()
+        || !(url.scheme() == "https" || local_http)
+        || url.path() != "/account/connect"
+        || !url.query_pairs().any(|(name, value)| name == "user_code" && value == expected_user_code) {
+        return Err("The account service returned an unsafe verification URL.".to_owned());
+    }
+    Ok(url.to_string())
+}
+
+#[tauri::command]
+async fn start_account_link(state: State<'_, AppState>) -> Result<StartAccountLinkResponse, String> {
+    if state.device_token()?.is_some() {
+        return Err("This device is already connected. Disconnect it before linking another account.".to_owned());
+    }
+    let response = state.api_client
+        .post(format!("{}/api/v1/device-auth/start", state.api_base_url))
+        .json(&serde_json::json!({
+            "device_label": "Your Dawnloader desktop",
+            "platform": env::consts::OS
+        }))
+        .send().await
+        .map_err(|_| "Could not reach the account service to start device linking.".to_owned())?;
+    if !response.status().is_success() {
+        return Err("The account service refused to start device linking.".to_owned());
+    }
+    let wire: DeviceLinkStartWire = response.json().await
+        .map_err(|_| "The account service returned an invalid device-link response.".to_owned())?;
+    if wire.device_code.len() < 32 || wire.device_code.len() > 128
+        || !wire.device_code.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("The account service returned an invalid device credential.".to_owned());
+    }
+    let verification_url = validate_verification_url(&wire.verification_url, &wire.user_code)?;
+    let link_id = Uuid::new_v4().to_string();
+    let pending = PendingDeviceLink {
+        device_code: wire.device_code,
+        expires_at: Instant::now() + Duration::from_secs(wire.expires_in_seconds.min(600)),
+        interval_seconds: wire.interval_seconds.clamp(2, 15),
+    };
+    state.pending_device_links.lock()
+        .map_err(|_| "Device-link manager is unavailable.".to_owned())?
+        .insert(link_id.clone(), pending);
+    Ok(StartAccountLinkResponse {
+        link_id,
+        user_code: wire.user_code,
+        verification_url,
+        expires_in_seconds: wire.expires_in_seconds.min(600),
+        interval_seconds: wire.interval_seconds.clamp(2, 15),
+    })
+}
+
+#[tauri::command]
+async fn poll_account_link(
+    state: State<'_, AppState>,
+    link_id: String,
+) -> Result<DeviceLinkPollResponse, String> {
+    let pending = state.pending_device_links.lock()
+        .map_err(|_| "Device-link manager is unavailable.".to_owned())?
+        .get(&link_id).cloned()
+        .ok_or_else(|| "This device-link session no longer exists. Start a new one.".to_owned())?;
+    if Instant::now() >= pending.expires_at {
+        if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
+        return Ok(DeviceLinkPollResponse {
+            status: "expired".to_owned(), display_name: None, email: None,
+            sync_download_history: None, device_label: None,
+        });
+    }
+
+    let response = state.api_client
+        .post(format!("{}/api/v1/device-auth/poll", state.api_base_url))
+        .json(&serde_json::json!({"device_code": pending.device_code}))
+        .send().await
+        .map_err(|_| "Could not check device approval. Check the network and retry.".to_owned())?;
+    if response.status() == StatusCode::ACCEPTED {
+        return Ok(DeviceLinkPollResponse {
+            status: "pending".to_owned(), display_name: None, email: None,
+            sync_download_history: None, device_label: None,
+        });
+    }
+    if matches!(response.status(), StatusCode::GONE | StatusCode::NOT_FOUND) {
+        if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
+        return Ok(DeviceLinkPollResponse {
+            status: "expired".to_owned(), display_name: None, email: None,
+            sync_download_history: None, device_label: None,
+        });
+    }
+    if !response.status().is_success() {
+        return Err("The account service could not check device approval.".to_owned());
+    }
+    let wire: DeviceLinkPollWire = response.json().await
+        .map_err(|_| "The account service returned an invalid approval response.".to_owned())?;
+    if wire.status != "authorized" {
+        return Err("The account service returned an unknown device-link status.".to_owned());
+    }
+
+    // This bearer credential is returned only to Rust and persisted only in the OS keychain.
+    AppState::save_device_token(&pending.device_code)?;
+    if let Ok(mut links) = state.pending_device_links.lock() { links.remove(&link_id); }
+    Ok(DeviceLinkPollResponse {
+        status: "authorized".to_owned(),
+        display_name: wire.display_name,
+        email: wire.email,
+        sync_download_history: wire.sync_download_history,
+        device_label: wire.device_label,
+    })
+}
+
+#[tauri::command]
+fn cancel_account_link(state: State<'_, AppState>, link_id: String) -> Result<bool, String> {
+    Ok(state.pending_device_links.lock()
+        .map_err(|_| "Device-link manager is unavailable.".to_owned())?
+        .remove(&link_id).is_some())
+}
+
+async fn fetch_linked_account(state: &AppState) -> Result<Option<LinkedAccountResponse>, String> {
+    let Some(token) = state.device_token()? else { return Ok(None) };
+    let response = state.api_client
+        .get(format!("{}/api/v1/device/me", state.api_base_url))
+        .bearer_auth(&token)
+        .send().await
+        .map_err(|_| "Could not verify the connected account. Check the network and try again.".to_owned())?;
+    if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+        let _ = AppState::clear_device_token();
+        return Ok(None);
+    }
+    if !response.status().is_success() {
+        return Err("The account service could not verify this device.".to_owned());
+    }
+    let payload: DeviceMeResponse = response.json().await
+        .map_err(|_| "The account service returned an unreadable account response.".to_owned())?;
+    Ok(Some(LinkedAccountResponse {
+        connected: true,
+        display_name: payload.user.display_name,
+        email: payload.user.email,
+        sync_download_history: payload.user.sync_download_history,
+    }))
+}
+
+#[tauri::command]
+async fn get_account_status(state: State<'_, AppState>) -> Result<Option<LinkedAccountResponse>, String> {
+    fetch_linked_account(state.inner()).await
+}
+
+#[tauri::command]
+async fn set_account_sync(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<LinkedAccountResponse, String> {
+    let token = state.device_token()?
+        .ok_or_else(|| "Connect this device to an account first.".to_owned())?;
+    let response = state.api_client
+        .put(format!("{}/api/v1/device/me/preferences", state.api_base_url))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({"sync_download_history": enabled}))
+        .send().await
+        .map_err(|_| "Could not update account preferences. Check the network and try again.".to_owned())?;
+    if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE) {
+        let _ = AppState::clear_device_token();
+        return Err("The device connection has expired or been revoked. Connect it again.".to_owned());
+    }
+    if !response.status().is_success() {
+        return Err("The account service rejected the preference change.".to_owned());
+    }
+    fetch_linked_account(state.inner()).await?
+        .ok_or_else(|| "Device was disconnected while updating preferences.".to_owned())
+}
+
+#[tauri::command]
+async fn disconnect_account(state: State<'_, AppState>) -> Result<bool, String> {
+    let Some(token) = state.device_token()? else { return Ok(false) };
+    let response = state.api_client
+        .post(format!("{}/api/v1/device/disconnect", state.api_base_url))
+        .bearer_auth(&token)
+        .send().await
+        .map_err(|_| "Could not disconnect this device from the account service. Try again while online.".to_owned())?;
+    if !(response.status().is_success()
+        || matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::GONE | StatusCode::NOT_FOUND)) {
+        return Err("The account service could not disconnect this device.".to_owned());
+    }
+    AppState::clear_device_token()?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -203,10 +586,12 @@ async fn start_download(
                     .and_then(|value| value.to_str())
                     .map(|value| value.to_ascii_lowercase());
                 let media_kind = media_kind_for_path(&outcome.path);
+                let record_id = Uuid::parse_str(&task_id).unwrap_or_else(|_| Uuid::new_v4());
+                let format_for_sync = format.clone();
                 let record = NewLocalDownloadRecord {
-                    id: Uuid::parse_str(&task_id).unwrap_or_else(|_| Uuid::new_v4()),
+                    id: record_id,
                     title: file_name.clone(),
-                    source_domain,
+                    source_domain: source_domain.clone(),
                     media_kind: media_kind.to_owned(),
                     format,
                     file_name: file_name.clone(),
@@ -218,6 +603,25 @@ async fn start_download(
                     Ok(store) => store.record_completed(record).await.err().map(|error| error.to_string()),
                     Err(error) => Some(error),
                 };
+                let mut completion_message = persistence_error.as_ref()
+                    .map(|_| "File downloaded, but local history could not be saved.".to_owned());
+                if completion_message.is_none() {
+                    let completed_at = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(i64::MAX as u128) as i64;
+                    if let Err(sync_error) = worker_state.sync_completed_download(
+                        record_id,
+                        &source_domain,
+                        &file_name,
+                        media_kind,
+                        format_for_sync.as_deref(),
+                        completed_at,
+                    ).await {
+                        completion_message = Some(sync_error);
+                    }
+                }
 
                 worker_state.emit(&app, DownloadProgress {
                     task_id: task_id.clone(),
@@ -225,7 +629,7 @@ async fn start_download(
                     file_name: Some(file_name),
                     downloaded_bytes: outcome.downloaded_bytes,
                     total_bytes: Some(outcome.downloaded_bytes),
-                    message: persistence_error.map(|_| "File downloaded, but local history could not be saved.".to_owned()),
+                    message: completion_message,
                 });
             }
             Err(DownloadError::Cancelled) => {
@@ -298,15 +702,24 @@ fn media_kind_for_path(path: &PathBuf) -> &'static str {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&app_data_dir)?;
-            app.manage(AppState::new(app_data_dir.join("download-history.sqlite3")));
+            let state = AppState::new(app_data_dir.join("download-history.sqlite3"))
+                .map_err(std::io::Error::other)?;
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             inspect_url,
             start_download,
+            start_account_link,
+            poll_account_link,
+            cancel_account_link,
+            get_account_status,
+            set_account_sync,
+            disconnect_account,
             cancel_download,
             list_downloads,
             delete_download_record,

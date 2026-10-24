@@ -270,6 +270,25 @@ fn validated_return_to(candidate: Option<&str>) -> String {
     candidate.to_owned()
 }
 
+fn normalize_login_provider(value: Option<&str>) -> Option<&'static str> {
+    match value.unwrap_or("email") {
+        "google" => Some("google"),
+        "apple" => Some("apple"),
+        "email" => Some("email"),
+        "register" => Some("register"),
+        "reset_password" => Some("reset_password"),
+        _ => None,
+    }
+}
+
+fn is_assignable_user_role(role: &str) -> bool {
+    matches!(role, "admin" | "vip_user" | "regular_user")
+}
+
+fn is_valid_account_status(status: &str) -> bool {
+    matches!(status, "active" | "suspended")
+}
+
 fn normalize_user_code(value: &str) -> Option<String> {
     let normalized: String = value.chars()
         .filter(|character| *character != '-' && !character.is_whitespace())
@@ -564,10 +583,8 @@ async fn oidc_login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let return_to = validated_return_to(query.return_to.as_deref());
-    let provider = query.provider.as_deref().unwrap_or("email");
-    if !matches!(provider, "google" | "apple" | "email" | "register" | "reset_password") {
-        return Err(api_error(StatusCode::BAD_REQUEST, "identity_provider_option_invalid"));
-    }
+    let provider = normalize_login_provider(query.provider.as_deref())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "identity_provider_option_invalid"))?;
     let oauth_state = random_token();
     let nonce = random_token();
     let verifier = random_token() + &random_token();
@@ -803,10 +820,10 @@ async fn admin_update_user(
         return Err(api_error(StatusCode::FORBIDDEN, "owner_account_protected"));
     }
 
-    if request.role.as_deref().is_some_and(|role| !matches!(role, "admin" | "vip_user" | "regular_user")) {
+    if request.role.as_deref().is_some_and(|role| !is_assignable_user_role(role)) {
         return Err(api_error(StatusCode::BAD_REQUEST, "user_role_invalid"));
     }
-    if request.account_status.as_deref().is_some_and(|status| !matches!(status, "active" | "suspended")) {
+    if request.account_status.as_deref().is_some_and(|status| !is_valid_account_status(status)) {
         return Err(api_error(StatusCode::BAD_REQUEST, "user_status_invalid"));
     }
     let display_name = request.display_name.as_deref().map(str::trim);
@@ -1007,6 +1024,28 @@ mod account_security_tests {
         assert_eq!(validated_return_to(Some("//evil.example/path")), "/account/downloads");
         assert_eq!(validated_return_to(Some("https://evil.example/")), "/account/downloads");
         assert_eq!(validated_return_to(Some("/account/delete")), "/account/downloads");
+    }
+
+    #[test]
+    fn login_intents_are_allowlisted() {
+        assert_eq!(normalize_login_provider(None), Some("email"));
+        assert_eq!(normalize_login_provider(Some("google")), Some("google"));
+        assert_eq!(normalize_login_provider(Some("apple")), Some("apple"));
+        assert_eq!(normalize_login_provider(Some("register")), Some("register"));
+        assert_eq!(normalize_login_provider(Some("reset_password")), Some("reset_password"));
+        assert_eq!(normalize_login_provider(Some("https://evil.example")), None);
+    }
+
+    #[test]
+    fn owner_role_cannot_be_assigned_through_regular_user_update() {
+        assert!(is_assignable_user_role("regular_user"));
+        assert!(is_assignable_user_role("vip_user"));
+        assert!(is_assignable_user_role("admin"));
+        assert!(!is_assignable_user_role("owner"));
+        assert!(!is_assignable_user_role("unknown"));
+        assert!(is_valid_account_status("active"));
+        assert!(is_valid_account_status("suspended"));
+        assert!(!is_valid_account_status("deleted"));
     }
 
     #[test]

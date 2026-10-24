@@ -409,9 +409,9 @@ pub async fn download_direct(
     let mut file_name: Option<String> = None;
     let mut is_resuming = false;
 
-    // Retry the same URL with Range only when we have a real, validator-backed partial.
-    // The first un-ranged response also ensures that a server which changes redirects
-    // or validators cannot cause unrelated bytes to be appended.
+    // Retry with Range only when a saved partial and a strong validator exist.
+    // Compare the final response URL, validator, offset, and Content-Range before appending.
+    // A server that ignores Range or changes the resource must restart from byte zero.
     if let Some(state) = saved_state.take() {
         response = send_get(&client, &parsed_url, Some(&state.metadata), state.offset, &cancellation).await?;
         match response.status() {

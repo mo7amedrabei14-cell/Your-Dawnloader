@@ -30,7 +30,11 @@ use url::Url;
 use uuid::Uuid;
 
 const MAX_REDIRECTS: usize = 5;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+// Downloads can be large; a total 60-second deadline would abort valid transfers.
+// Bound connection setup and idle reads separately, while retaining a generous hard ceiling.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_DOWNLOAD_DURATION: Duration = Duration::from_secs(12 * 60 * 60);
 const MAX_FILENAME_CHARS: usize = 180;
 const RESUME_VERSION: u8 = 1;
 
@@ -382,7 +386,9 @@ pub async fn download_direct(
     let _active = ActiveDownloadGuard::acquire(active_key)?;
 
     let client = Client::builder()
-        .timeout(DEFAULT_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
+        .timeout(MAX_DOWNLOAD_DURATION)
         .redirect(Policy::custom(|attempt| {
             if attempt.previous().len() >= MAX_REDIRECTS {
                 return attempt.error("redirect limit exceeded");

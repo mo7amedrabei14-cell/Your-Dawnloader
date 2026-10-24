@@ -178,6 +178,8 @@ impl Storage {
         .execute(&mut *tx).await?;
 
         if is_owner {
+            sqlx::query("UPDATE app_users SET role='regular_user' WHERE role='owner' AND id<>$1")
+                .bind(user_id).execute(&mut *tx).await?;
             sqlx::query("UPDATE app_users SET role='owner', account_status='active' WHERE id=$1")
                 .bind(user_id).execute(&mut *tx).await?;
         }

@@ -46,6 +46,12 @@ pub enum DeviceLinkStatus {
     Revoked,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerBootstrap<'a> {
+    pub email: &'a str,
+    pub display_name: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionIdentity {
     pub user_id: Uuid,
@@ -138,11 +144,10 @@ impl Storage {
         email: Option<&str>,
         email_verified: bool,
         display_name: Option<&str>,
-        owner_email: &str,
-        owner_display_name: &str,
+        owner: OwnerBootstrap<'_>,
     ) -> Result<Uuid, StorageError> {
-        let is_owner = is_verified_owner_email(email, email_verified, owner_email);
-        let account_display_name = if is_owner { Some(owner_display_name) } else { display_name };
+        let is_owner = is_verified_owner_email(email, email_verified, owner.email);
+        let account_display_name = if is_owner { Some(owner.display_name) } else { display_name };
         let mut tx = self.pool.begin().await?;
         let proposed_id = Uuid::new_v4();
         let row = sqlx::query(

@@ -28,3 +28,24 @@ CREATE POLICY user_profiles_owner_policy ON user_profiles
               AND actor.account_status = 'active'
         )
     );
+
+-- A verified Owner may revoke another user's device when suspending that account.
+-- This is an UPDATE-only policy; it does not grant the Owner broad device-row reads/inserts.
+CREATE POLICY user_devices_owner_revoke_policy ON user_devices
+    FOR UPDATE
+    USING (
+        EXISTS (
+            SELECT 1 FROM app_users AS actor
+            WHERE actor.id = NULLIF(current_setting('app.user_id', true), '')::uuid
+              AND actor.role = 'owner'
+              AND actor.account_status = 'active'
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM app_users AS actor
+            WHERE actor.id = NULLIF(current_setting('app.user_id', true), '')::uuid
+              AND actor.role = 'owner'
+              AND actor.account_status = 'active'
+        )
+    );

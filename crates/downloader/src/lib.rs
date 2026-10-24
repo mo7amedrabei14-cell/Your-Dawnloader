@@ -254,12 +254,19 @@ async fn load_resume_state(
         Err(error) => return Err(DownloadError::Io(error)),
     };
 
-    let (Some(partial_metadata), Some(sidecar_metadata)) = (partial_metadata, sidecar_metadata) else {
+    if partial_metadata.is_none() || sidecar_metadata.is_none() {
         if partial_metadata.is_some() || sidecar_metadata.is_some() {
             discard_resume_files(files).await?;
         }
         return Ok(None);
-    };
+    }
+    let partial_metadata = partial_metadata.expect("checked above");
+    let sidecar_metadata = sidecar_metadata.expect("checked above");
+
+    if sidecar_metadata.len() > 16 * 1024 {
+        discard_resume_files(files).await?;
+        return Ok(None);
+    }
 
     if !partial_metadata.file_type().is_file()
         || partial_metadata.file_type().is_symlink()
@@ -720,9 +727,7 @@ mod tests {
             assert!(first_request.starts_with("GET /sample.bin?token=do-not-store-this-secret HTTP/1.1"));
             assert!(!first_request.to_ascii_lowercase().contains("range:"));
             let prefix = b"hello";
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"v1\"\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
-            );
+            let head = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"v1\"\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
             first.write_all(head.as_bytes()).await.unwrap();
             first.write_all(prefix).await.unwrap();
             first.flush().await.unwrap();

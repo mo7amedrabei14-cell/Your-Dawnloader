@@ -64,7 +64,7 @@ changed from a verified payment/webhook flow, not from a browser form.
 From the repository root on Windows PowerShell:
 
 ```powershell
-.scriptsdevstart-api.ps1
+.\scripts\dev\start-api.ps1
 ```
 
 On first run, the script copies `apps/api/.env.example` to the ignored `apps/api/.env`, starts the
@@ -109,9 +109,10 @@ the public API URL. They are different values and must never be swapped.
   `OWNER_DISPLAY_NAME=Mohamed Rabea`. Never use display-name matching as an owner grant.
 - Set `APP_BASE_URL` to the site's full base URL and match CORS/cookie settings.
 
-Logto is a compatible OIDC-broker candidate because its sign-in experience supports provider-specific
-social sign-in and first-screen options, including password reset. If it is chosen, Google, Apple and
-email/password live in Logto while the Rust API remains the application's data/API backend.
+Logto is the selected OIDC-broker implementation target because its sign-in experience supports provider-specific
+social sign-in and first-screen options, including password reset. Google, Apple and email/password live in Logto
+while the Rust API remains the application's data/API backend. The real Logto tenant and provider credentials
+still need to be configured by the owner.
 
 ## GitHub Pages and browser cookies
 

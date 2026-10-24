@@ -389,7 +389,7 @@ pub async fn download_direct(
         .build()?;
 
     let mut saved_state = load_resume_state(&files, &source_fingerprint, request.max_bytes).await?;
-    let mut response = send_get(&client, &parsed_url, None, 0, &cancellation).await?;
+    let mut response: Response;
     let mut resumed_offset = 0_u64;
     let mut resume_metadata: Option<ResumeMetadata> = None;
     let mut total_bytes: Option<u64> = None;
@@ -435,6 +435,8 @@ pub async fn download_direct(
                 response = send_get(&client, &parsed_url, None, 0, &cancellation).await?;
             }
         }
+    } else {
+        response = send_get(&client, &parsed_url, None, 0, &cancellation).await?;
     }
 
     if !is_resuming {

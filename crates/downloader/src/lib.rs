@@ -568,7 +568,7 @@ pub async fn download_direct(
     }
 
     if let Some(error) = failure {
-        let keep_partial = if resume_metadata.is_some() && !matches!(error, DownloadError::TooLarge) {
+        let keep_partial = if resume_metadata.is_some() && !matches!(&error, DownloadError::TooLarge) {
             output.flush().await.is_ok()
                 && output.sync_all().await.is_ok()
                 && fs::symlink_metadata(&files.partial).await

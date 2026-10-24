@@ -46,6 +46,12 @@ pub enum DeviceLinkStatus {
     Revoked,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OwnerBootstrap<'a> {
+    pub email: &'a str,
+    pub display_name: &'a str,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionIdentity {
     pub user_id: Uuid,
@@ -56,7 +62,15 @@ pub struct SessionIdentity {
     pub display_name: Option<String>,
     pub locale: String,
     pub sync_download_history: bool,
+    pub role: String,
+    pub account_status: String,
 }
+
+fn is_verified_owner_email(email: Option<&str>, email_verified: bool, owner_email: &str) -> bool {
+    email_verified
+        && email.is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(owner_email.trim()))
+}
+
 
 impl Storage {
     pub async fn connect(database_url: &str) -> Result<Self, StorageError> {
@@ -117,7 +131,10 @@ impl Storage {
         email: Option<&str>,
         email_verified: bool,
         display_name: Option<&str>,
+        owner: OwnerBootstrap<'_>,
     ) -> Result<Uuid, StorageError> {
+        let is_owner = is_verified_owner_email(email, email_verified, owner.email);
+        let account_display_name = if is_owner { Some(owner.display_name) } else { display_name };
         let mut tx = self.pool.begin().await?;
         let proposed_id = Uuid::new_v4();
         let row = sqlx::query(
@@ -144,8 +161,15 @@ impl Storage {
                email_verified=(user_profiles.email_verified OR EXCLUDED.email_verified),
                updated_at=now()"
         )
-        .bind(user_id).bind(display_name).bind(email).bind(email_verified)
+        .bind(user_id).bind(account_display_name).bind(email).bind(email_verified)
         .execute(&mut *tx).await?;
+
+        if is_owner {
+            sqlx::query("UPDATE app_users SET role='regular_user' WHERE role='owner' AND id<>$1")
+                .bind(user_id).execute(&mut *tx).await?;
+            sqlx::query("UPDATE app_users SET role='owner', account_status='active' WHERE id=$1")
+                .bind(user_id).execute(&mut *tx).await?;
+        }
 
         sqlx::query("INSERT INTO account_preferences(owner_user_id) VALUES ($1) ON CONFLICT(owner_user_id) DO NOTHING")
             .bind(user_id).execute(&mut *tx).await?;
@@ -185,7 +209,8 @@ impl Storage {
         let row = sqlx::query(
             "SELECT u.id AS user_id, u.identity_issuer AS issuer, u.identity_subject AS subject,
                     p.email, p.email_verified, p.display_name, p.locale,
-                    COALESCE(pref.sync_download_history, FALSE) AS sync_download_history
+                    COALESCE(pref.sync_download_history, FALSE) AS sync_download_history,
+                    u.role, u.account_status
              FROM account_sessions s
              JOIN app_users u ON u.id=s.owner_user_id
              LEFT JOIN user_profiles p ON p.owner_user_id=u.id
@@ -204,6 +229,8 @@ impl Storage {
                 display_name: row.try_get("display_name")?,
                 locale: row.try_get("locale")?,
                 sync_download_history: row.try_get("sync_download_history")?,
+                role: row.try_get("role")?,
+                account_status: row.try_get("account_status")?,
             })
         } else {
             None
@@ -559,6 +586,7 @@ impl Storage {
             "SELECT u.id AS user_id, u.identity_issuer AS issuer, u.identity_subject AS subject,
                     p.email, p.email_verified, p.display_name, p.locale,
                     COALESCE(pref.sync_download_history, FALSE) AS sync_download_history,
+                    u.role, u.account_status,
                     d.id AS device_id, d.device_label, d.platform
              FROM device_link_requests r
              JOIN user_devices d ON d.id=r.device_id AND d.owner_user_id=r.owner_user_id
@@ -566,7 +594,8 @@ impl Storage {
              LEFT JOIN user_profiles p ON p.owner_user_id=u.id
              LEFT JOIN account_preferences pref ON pref.owner_user_id=u.id
              WHERE r.device_code_hash=$1 AND r.owner_user_id=$2 AND r.device_id=$3
-               AND r.approved_at IS NOT NULL AND r.revoked_at IS NULL AND d.revoked_at IS NULL"
+               AND r.approved_at IS NOT NULL AND r.revoked_at IS NULL AND d.revoked_at IS NULL
+               AND u.account_status='active'"
         )
         .bind(device_code_hash).bind(owner_user_id).bind(device_id)
         .fetch_optional(&mut *tx).await?;
@@ -583,6 +612,8 @@ impl Storage {
             display_name: row.try_get("display_name")?,
             locale: row.try_get("locale")?,
             sync_download_history: row.try_get("sync_download_history")?,
+            role: row.try_get("role")?,
+            account_status: row.try_get("account_status")?,
         };
         let device = DeviceIdentity {
             identity,
@@ -638,6 +669,113 @@ impl Storage {
         Ok(devices)
     }
 
+    /// Owner-only listing. The actor ID must come from the already verified browser session.
+    pub async fn list_admin_users(&self, actor_user_id: Uuid, limit: u32) -> Result<Vec<serde_json::Value>, StorageError> {
+        let mut tx = self.begin_user_transaction(actor_user_id).await?;
+        let rows = sqlx::query(
+            "SELECT u.id, u.role, u.account_status,
+                    p.email, COALESCE(p.email_verified, FALSE) AS email_verified, p.display_name, p.locale,
+                    to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+             FROM app_users u
+             LEFT JOIN user_profiles p ON p.owner_user_id=u.id
+             ORDER BY u.created_at DESC, u.id ASC
+             LIMIT $1"
+        )
+        .bind(i64::from(limit.clamp(1, 100)))
+        .fetch_all(&mut *tx).await?;
+        let mut users = Vec::with_capacity(rows.len());
+        for row in rows {
+            users.push(serde_json::json!({
+                "id": row.try_get::<Uuid, _>("id")?,
+                "role": row.try_get::<String, _>("role")?,
+                "account_status": row.try_get::<String, _>("account_status")?,
+                "email": row.try_get::<Option<String>, _>("email")?,
+                "email_verified": row.try_get::<bool, _>("email_verified")?,
+                "display_name": row.try_get::<Option<String>, _>("display_name")?,
+                "locale": row.try_get::<Option<String>, _>("locale")?,
+                "created_at": row.try_get::<Option<String>, _>("created_at")?
+            }));
+        }
+        tx.commit().await?;
+        Ok(users)
+    }
+
+    /// Updates a non-owner account only. The authenticated actor must be checked as owner by the API.
+    pub async fn update_admin_user(
+        &self,
+        actor_user_id: Uuid,
+        target_user_id: Uuid,
+        role: Option<&str>,
+        account_status: Option<&str>,
+        display_name: Option<&str>,
+        locale: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, StorageError> {
+        let mut tx = self.begin_user_transaction(actor_user_id).await?;
+        let target = sqlx::query("SELECT role FROM app_users WHERE id=$1 FOR UPDATE")
+            .bind(target_user_id).fetch_optional(&mut *tx).await?;
+        let Some(target) = target else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let current_role: String = target.try_get("role")?;
+        if current_role == "owner" || target_user_id == actor_user_id {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        if let Some(role) = role {
+            sqlx::query("UPDATE app_users SET role=$2 WHERE id=$1")
+                .bind(target_user_id).bind(role).execute(&mut *tx).await?;
+        }
+        if let Some(account_status) = account_status {
+            sqlx::query("UPDATE app_users SET account_status=$2 WHERE id=$1")
+                .bind(target_user_id).bind(account_status).execute(&mut *tx).await?;
+            if account_status == "suspended" {
+                sqlx::query("UPDATE account_sessions SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_user_id=$1 AND revoked_at IS NULL")
+                    .bind(target_user_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE user_devices SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_user_id=$1 AND revoked_at IS NULL")
+                    .bind(target_user_id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE device_link_requests SET revoked_at=COALESCE(revoked_at, now()) WHERE owner_user_id=$1 AND revoked_at IS NULL")
+                    .bind(target_user_id).execute(&mut *tx).await?;
+            }
+        }
+        if display_name.is_some() || locale.is_some() {
+            // app.user_id is still the authenticated owner; the role-aware profile policy allows
+            // owners to edit non-owner profiles while ordinary sessions remain row-scoped.
+            sqlx::query(
+                "UPDATE user_profiles SET
+                    display_name=COALESCE($2, display_name),
+                    locale=COALESCE($3, locale),
+                    updated_at=now()
+                 WHERE owner_user_id=$1"
+            )
+            .bind(target_user_id).bind(display_name).bind(locale)
+            .execute(&mut *tx).await?;
+        }
+
+        let row = sqlx::query(
+            "SELECT u.id, u.role, u.account_status,
+                    p.email, COALESCE(p.email_verified, FALSE) AS email_verified, p.display_name, p.locale,
+                    to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
+             FROM app_users u
+             LEFT JOIN user_profiles p ON p.owner_user_id=u.id
+             WHERE u.id=$1"
+        )
+        .bind(target_user_id).fetch_one(&mut *tx).await?;
+        let user = serde_json::json!({
+            "id": row.try_get::<Uuid, _>("id")?,
+            "role": row.try_get::<String, _>("role")?,
+            "account_status": row.try_get::<String, _>("account_status")?,
+            "email": row.try_get::<Option<String>, _>("email")?,
+            "email_verified": row.try_get::<bool, _>("email_verified")?,
+            "display_name": row.try_get::<Option<String>, _>("display_name")?,
+            "locale": row.try_get::<Option<String>, _>("locale")?,
+            "created_at": row.try_get::<Option<String>, _>("created_at")?
+        });
+        tx.commit().await?;
+        Ok(Some(user))
+    }
+
     /// Permanently deletes the account and dependent cloud metadata via declared foreign-key cascades.
     /// The caller must pass the user ID resolved from the active verified session.
     pub async fn delete_account(&self, user_id: Uuid) -> Result<bool, StorageError> {
@@ -646,5 +784,19 @@ impl Storage {
             .bind(user_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(result.rows_affected() == 1)
+    }
+}
+
+#[cfg(test)]
+mod account_role_tests {
+    use super::is_verified_owner_email;
+
+    #[test]
+    fn owner_requires_an_exact_verified_email_match() {
+        assert!(is_verified_owner_email(Some("Mohamed@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("mohamed@example.com"), false, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("someone-else@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(None, true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("Mohamed@example.com.evil"), true, "mohamed@example.com"));
     }
 }

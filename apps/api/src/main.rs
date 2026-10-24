@@ -13,7 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dawn_api_contract::UpsertDownloadRecordRequest;
-use dawn_storage::{DeviceIdentity, DeviceLinkStatus, SessionIdentity, Storage};
+use dawn_storage::{DeviceIdentity, DeviceLinkStatus, OwnerBootstrap, SessionIdentity, Storage};
 use jsonwebtoken::{
     decode, decode_header,
     jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse},
@@ -47,6 +47,8 @@ struct AuthConfig {
     app_origin: String,
     cookie_secure: bool,
     cookie_same_site: String,
+    owner_email: String,
+    owner_display_name: String,
 }
 
 impl AuthConfig {
@@ -77,6 +79,17 @@ impl AuthConfig {
         if cookie_same_site == "None" && !cookie_secure {
             anyhow::bail!("COOKIE_SAME_SITE=None requires COOKIE_SECURE=true");
         }
+        let owner_email = required("OWNER_EMAIL")?.trim().to_ascii_lowercase();
+        if !owner_email.contains('@') || owner_email.len() > 320 || owner_email.chars().any(char::is_control) {
+            anyhow::bail!("OWNER_EMAIL must be a valid email address that the identity provider verifies");
+        }
+        let owner_display_name = env::var("OWNER_DISPLAY_NAME")
+            .unwrap_or_else(|_| "Mohamed Rabea".to_owned());
+        let owner_display_name = owner_display_name.trim().to_owned();
+        if owner_display_name.is_empty() || owner_display_name.chars().count() > 80
+            || owner_display_name.chars().any(char::is_control) {
+            anyhow::bail!("OWNER_DISPLAY_NAME must contain between 1 and 80 printable characters");
+        }
 
         let config = Self {
             issuer: required("OIDC_ISSUER")?,
@@ -90,6 +103,8 @@ impl AuthConfig {
             app_origin,
             cookie_secure,
             cookie_same_site,
+            owner_email,
+            owner_display_name,
         };
 
         for (name, value) in [
@@ -205,6 +220,15 @@ struct CallbackQuery {
 #[derive(Debug, Deserialize)]
 struct LoginQuery {
     return_to: Option<String>,
+    provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminUpdateUserRequest {
+    role: Option<String>,
+    account_status: Option<String>,
+    display_name: Option<String>,
+    locale: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct DeviceAuthStartRequest {
@@ -244,6 +268,25 @@ fn validated_return_to(candidate: Option<&str>) -> String {
         return "/account/downloads".to_owned();
     }
     candidate.to_owned()
+}
+
+fn normalize_login_provider(value: Option<&str>) -> Option<&'static str> {
+    match value.unwrap_or("email") {
+        "google" => Some("google"),
+        "apple" => Some("apple"),
+        "email" => Some("email"),
+        "register" => Some("register"),
+        "reset_password" => Some("reset_password"),
+        _ => None,
+    }
+}
+
+fn is_assignable_user_role(role: &str) -> bool {
+    matches!(role, "admin" | "vip_user" | "regular_user")
+}
+
+fn is_valid_account_status(status: &str) -> bool {
+    matches!(status, "active" | "suspended")
 }
 
 fn normalize_user_code(value: &str) -> Option<String> {
@@ -312,6 +355,9 @@ async fn authenticate(
     let identity = state.storage.session_identity(&token_hash).await
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_lookup_failed"))?
         .ok_or_else(|| api_error(StatusCode::UNAUTHORIZED, "session_expired"))?;
+    if identity.account_status != "active" {
+        return Err(api_error(StatusCode::FORBIDDEN, "account_suspended"));
+    }
     Ok((token_hash, identity))
 }
 
@@ -431,6 +477,7 @@ async fn device_me(
         "user": {
             "id":device.identity.user_id, "email":device.identity.email,
             "display_name":device.identity.display_name, "locale":device.identity.locale,
+            "role":device.identity.role, "account_status":device.identity.account_status,
             "sync_download_history":device.identity.sync_download_history
         },
         "device": {"id":device.device_id,"label":device.device_label,"platform":device.platform}
@@ -536,6 +583,8 @@ async fn oidc_login(
     Query(query): Query<LoginQuery>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let return_to = validated_return_to(query.return_to.as_deref());
+    let provider = normalize_login_provider(query.provider.as_deref())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "identity_provider_option_invalid"))?;
     let oauth_state = random_token();
     let nonce = random_token();
     let verifier = random_token() + &random_token();
@@ -554,6 +603,15 @@ async fn oidc_login(
         .append_pair("nonce", &nonce)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256");
+    // These user-experience parameters are supported by Logto's OIDC sign-in experience.
+    // The OIDC protocol itself remains standard; provider credentials stay in the identity broker.
+    match provider {
+        "google" => { url.query_pairs_mut().append_pair("direct_sign_in", "social:google"); }
+        "apple" => { url.query_pairs_mut().append_pair("direct_sign_in", "social:apple"); }
+        "register" => { url.query_pairs_mut().append_pair("first_screen", "register"); }
+        "reset_password" => { url.query_pairs_mut().append_pair("first_screen", "reset_password"); }
+        _ => { url.query_pairs_mut().append_pair("first_screen", "sign_in"); }
+    }
     let mut response = Redirect::temporary(url.as_str()).into_response();
     let secure = if state.config.cookie_secure { "; Secure" } else { "" };
     let state_cookie = HeaderValue::from_str(&format!(
@@ -633,7 +691,11 @@ async fn oidc_callback(
     let email = if email_verified { claims.email.as_deref() } else { None };
     let display_name = claims.name.as_deref().or(claims.preferred_username.as_deref()).or(email);
     let user_id = state.storage.upsert_oidc_user(
-        &claims.iss, &claims.sub, email, email_verified, display_name
+        &claims.iss, &claims.sub, email, email_verified, display_name,
+        OwnerBootstrap {
+            email: &state.config.owner_email,
+            display_name: &state.config.owner_display_name,
+        }
     ).await.map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_setup_failed"))?;
 
     let session = random_token() + &random_token();
@@ -667,6 +729,8 @@ async fn me(
         "email_verified": user.email_verified,
         "display_name": user.display_name,
         "locale": user.locale,
+        "role": user.role,
+        "account_status": user.account_status,
         "preferences": { "sync_download_history": user.sync_download_history }
     })))
 }
@@ -726,6 +790,63 @@ async fn upsert_download(
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "download_record_save_failed"))?;
     serde_json::to_value(record).map(Json)
         .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response_serialization_failed"))
+}
+
+async fn admin_list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (_, actor) = authenticate(&state, &headers).await?;
+    if actor.role != "owner" {
+        return Err(api_error(StatusCode::FORBIDDEN, "owner_required"));
+    }
+    let users = state.storage.list_admin_users(actor.user_id, query.limit.unwrap_or(50)).await
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "admin_user_list_failed"))?;
+    Ok(Json(json!({"users": users})))
+}
+
+async fn admin_update_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AdminUpdateUserRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let (session, actor) = authenticate(&state, &headers).await?;
+    check_csrf(&state, &headers, &session).await?;
+    if actor.role != "owner" {
+        return Err(api_error(StatusCode::FORBIDDEN, "owner_required"));
+    }
+    let target_id = Uuid::parse_str(&id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "user_id_invalid"))?;
+    if target_id == actor.user_id {
+        return Err(api_error(StatusCode::FORBIDDEN, "owner_account_protected"));
+    }
+
+    if request.role.as_deref().is_some_and(|role| !is_assignable_user_role(role)) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "user_role_invalid"));
+    }
+    if request.account_status.as_deref().is_some_and(|status| !is_valid_account_status(status)) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "user_status_invalid"));
+    }
+    let display_name = request.display_name.as_deref().map(str::trim);
+    if display_name.is_some_and(|name| name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control)) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "display_name_invalid"));
+    }
+    if request.locale.as_deref().is_some_and(|locale| !matches!(locale, "en" | "ar")) {
+        return Err(api_error(StatusCode::BAD_REQUEST, "locale_invalid"));
+    }
+    if request.role.is_none() && request.account_status.is_none()
+        && display_name.is_none() && request.locale.is_none() {
+        return Err(api_error(StatusCode::BAD_REQUEST, "user_update_empty"));
+    }
+
+    let updated = state.storage.update_admin_user(
+        actor.user_id, target_id, request.role.as_deref(),
+        request.account_status.as_deref(), display_name, request.locale.as_deref()
+    ).await.map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "admin_user_update_failed"))?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "user_not_found_or_protected"))?;
+    Ok(Json(json!({"user": updated})))
 }
 
 async fn list_account_devices(
@@ -879,6 +1000,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/me/devices", get(list_account_devices))
         .route("/api/v1/me/devices/{id}", delete(revoke_account_device))
         .route("/api/v1/me/preferences", put(update_preferences))
+        .route("/api/v1/admin/users", get(admin_list_users))
+        .route("/api/v1/admin/users/{id}", axum::routing::patch(admin_update_user))
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/downloads", get(list_downloads).post(upsert_download).delete(clear_downloads))
         .route("/api/v1/downloads/{id}", delete(delete_download))
@@ -904,6 +1027,28 @@ mod account_security_tests {
         assert_eq!(validated_return_to(Some("//evil.example/path")), "/account/downloads");
         assert_eq!(validated_return_to(Some("https://evil.example/")), "/account/downloads");
         assert_eq!(validated_return_to(Some("/account/delete")), "/account/downloads");
+    }
+
+    #[test]
+    fn login_intents_are_allowlisted() {
+        assert_eq!(normalize_login_provider(None), Some("email"));
+        assert_eq!(normalize_login_provider(Some("google")), Some("google"));
+        assert_eq!(normalize_login_provider(Some("apple")), Some("apple"));
+        assert_eq!(normalize_login_provider(Some("register")), Some("register"));
+        assert_eq!(normalize_login_provider(Some("reset_password")), Some("reset_password"));
+        assert_eq!(normalize_login_provider(Some("https://evil.example")), None);
+    }
+
+    #[test]
+    fn owner_role_cannot_be_assigned_through_regular_user_update() {
+        assert!(is_assignable_user_role("regular_user"));
+        assert!(is_assignable_user_role("vip_user"));
+        assert!(is_assignable_user_role("admin"));
+        assert!(!is_assignable_user_role("owner"));
+        assert!(!is_assignable_user_role("unknown"));
+        assert!(is_valid_account_status("active"));
+        assert!(is_valid_account_status("suspended"));
+        assert!(!is_valid_account_status("deleted"));
     }
 
     #[test]

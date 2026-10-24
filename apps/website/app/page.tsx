@@ -11,8 +11,8 @@ export default function HomePage() {
     <main className="site-shell">
       <nav className="nav" aria-label="Main navigation">
         <Link className="brand" href="/"><span className="brand-mark">D</span><span>Your Dawnloader</span></Link>
-        <div className="nav-links"><Link href="#features">Features</Link><Link href="/downloads">Downloads</Link><Link href="/account/downloads">My Downloads</Link><Link href="/security">Security</Link></div>
-        <Link className="nav-cta" href="/account/downloads">Account library ↗</Link>
+        <div className="nav-links"><Link href="#features">Features</Link><Link href="/downloads">Downloads</Link><Link href="/account/downloads">My Downloads</Link><Link href="/security">Security</Link><Link href="/login">Sign in</Link></div>
+        <Link className="nav-cta" href="/login">Sign in / Create account ↗</Link>
       </nav>
 
       <section className="hero" data-reveal>

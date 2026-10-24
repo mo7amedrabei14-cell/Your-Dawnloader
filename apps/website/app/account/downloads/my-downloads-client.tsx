@@ -9,6 +9,8 @@ type Account = {
   email_verified: boolean;
   display_name: string | null;
   locale: string;
+  role: "owner" | "admin" | "vip_user" | "regular_user";
+  account_status: "active" | "suspended";
   preferences: { sync_download_history: boolean };
 };
 type AccountDevice = {
@@ -212,10 +214,10 @@ export default function MyDownloadsClient() {
     <main className="site-shell">
       <nav className="nav">
         <Link className="brand" href="/"><span className="brand-mark">D</span>Your Dawnloader</Link>
-        <div className="nav-links"><Link href="/downloads">Downloads</Link><Link href="/security">Security</Link></div>
+        <div className="nav-links"><Link href="/downloads">Downloads</Link><Link href="/security">Security</Link>{account?.role === "owner" && <Link href="/account/admin/users">User administration</Link>}</div>
         {account
           ? <button className="nav-cta" onClick={logout} disabled={working}>Sign out</button>
-          : <a className="nav-cta" href={API_BASE ? API_BASE + "/auth/oidc/login" : undefined}>Sign in ↗</a>}
+          : <Link className="nav-cta" href="/login">Sign in ↗</Link>}
       </nav>
 
       <section className="account-card account-library">
@@ -231,7 +233,7 @@ export default function MyDownloadsClient() {
             <div className="symbol">◎</div>
             <h2>Sign in to your personal account</h2>
             <p>Each person has a separate account, private settings, and download history. Authentication is delegated to the configured identity provider.</p>
-            {API_BASE && <a className="primary" href={API_BASE + "/auth/oidc/login"}>Continue to sign in ↗</a>}
+            {API_BASE && <Link className="primary" href="/login">Continue to sign in ↗</Link>}
           </div>
         ) : (
           <>

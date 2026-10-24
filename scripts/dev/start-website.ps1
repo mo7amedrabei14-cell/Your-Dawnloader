@@ -24,7 +24,7 @@ if (-not (Test-Path "node_modules")) {
     if ($LASTEXITCODE -ne 0) { throw "npm install failed." }
 }
 
-Write-Host "Starting website at http://localhost:3000 ..." -ForegroundColor Green
+Write-Host "Starting website at http://127.0.0.1:3000 ..." -ForegroundColor Green
 Write-Host "This script starts only the website. Run scripts\dev\start-api.ps1 in another PowerShell window for the API." -ForegroundColor DarkGray
 npm run dev
 if ($LASTEXITCODE -ne 0) { throw "The website development server stopped with an error." }

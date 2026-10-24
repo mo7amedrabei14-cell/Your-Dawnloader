@@ -9,10 +9,10 @@
 
 ## Local testing
 
-Use the local helper from the repo root:
+From the repository root in Windows PowerShell, run the API helper:
 
 ```powershell
-.scriptsdevstart-api.ps1
+.\scripts\dev\start-api.ps1
 ```
 
 It creates `apps/api/.env` from `.env.example` if needed, starts only a local PostgreSQL container
@@ -26,10 +26,10 @@ Invoke-RestMethod http://127.0.0.1:8080/health/live
 Invoke-RestMethod http://127.0.0.1:8080/health/ready
 ```
 
-Start the web UI in a second PowerShell window:
+Start the web UI in a second PowerShell window, also from the repository root:
 
 ```powershell
-.scriptsdevstart-website.ps1
+.\scripts\dev\start-website.ps1
 ```
 
 ## Hosted database

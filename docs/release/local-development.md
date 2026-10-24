@@ -51,6 +51,7 @@ Open `http://127.0.0.1:3000`. This starts the web UI, not the API.
   hashed browser sessions, and verified profile fields.
 - `crates/storage/migrations/0003_device_link_requests.sql`: temporary device-link
   requests and their constraints/indexes.
+- `crates/storage/migrations/0004_account_roles_and_status.sql`: Owner/Admin/VIP/Regular roles and account suspension status.
 
 SQLx records migration versions and skips migrations already applied. Back up a
 database before making schema changes. Prefer creating a new numbered migration

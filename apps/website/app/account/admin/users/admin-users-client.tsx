@@ -40,12 +40,6 @@ function initialEdit(user: AdminUser): Edit {
     locale: user.locale === "ar" ? "ar" : "en",
   };
 }
-const roleLabels: Record<Role, string> = {
-  owner: "Owner",
-  admin: "Admin (reserved)",
-  vip_user: "VIP User",
-  regular_user: "Regular User",
-};
 
 export default function AdminUsersClient() {
   const [users, setUsers] = useState<AdminUser[]>([]);
@@ -123,7 +117,8 @@ export default function AdminUsersClient() {
                   </div>
                   <div className="admin-user-fields">
                     <label>Role
-                      <select value={locked ? "regular_user" : edit.role} disabled={locked || working === user.id} onChange={event => updateEdit(user.id, { role: event.target.value as Edit["role"] })}>
+                      <select value={locked ? "owner" : edit.role} disabled={locked || working === user.id} onChange={event => updateEdit(user.id, { role: event.target.value as Edit["role"] })}>
+                        <option value="owner" disabled>Owner (protected)</option>
                         <option value="regular_user">Regular User</option>
                         <option value="vip_user">VIP User</option>
                         <option value="admin">Admin (reserved)</option>

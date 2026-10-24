@@ -698,7 +698,7 @@ mod tests {
     fn temporary_directory(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("your-dawnloader-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
-        path
+        std::fs::canonicalize(&path).unwrap()
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> String {

@@ -36,3 +36,26 @@ This implementation has passed repository CI but is not a security certification
 - Run PostgreSQL integration tests for cross-account access, migrations, export/deletion cascades, revocation, and concurrent device approval.
 - Verify production database TLS, backup/restore, retention/expiry, log redaction, and incident-response practices.
 - Complete account recovery and session/device management UX, legal privacy disclosures, signed installers, and an external security review.
+
+
+## Product roles and identity provider responsibilities
+
+The application database now has four roles: `owner`, `admin`, `vip_user`, and `regular_user`.
+New OIDC accounts default to `regular_user`. The `OWNER_EMAIL` server setting grants `owner`
+only when the verified OIDC email matches exactly; the UI display name is never used to grant
+privileges. The API exposes owner-only user listing and updates, and protects the Owner account
+from those edits. `admin` is a reserved role with no extra API permissions until explicitly added.
+VIP must be based on verified payment/entitlement signals later, not a client-controlled request.
+
+Google, Apple, email/password registration, and forgotten-password recovery are configured in one
+OIDC identity broker. The API keeps a single OIDC trust relationship and local product profiles.
+The web sign-in screen uses Logto-specific `direct_sign_in` and `first_screen` parameters, so this
+screen currently expects Logto as the configured broker. In Logto, enable Google and Apple social
+connectors plus email/password sign-up and a working email connector/password-reset template.
+The broker owns password hashes, verification tokens, reset tokens and password changes; this
+application database stores only app profile/role/status data.
+
+Set `OWNER_EMAIL` and `OWNER_DISPLAY_NAME=Mohamed Rabea` in the API's server environment.
+Use the database migration `0004_account_roles_and_status.sql` to add roles/status. It runs
+automatically on API startup. See `docs/product/account-system.md` and
+`docs/release/database-setup.md` for the workflow and database connection instructions.

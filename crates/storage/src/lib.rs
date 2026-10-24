@@ -71,19 +71,6 @@ fn is_verified_owner_email(email: Option<&str>, email_verified: bool, owner_emai
         && email.is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(owner_email.trim()))
 }
 
-#[cfg(test)]
-mod account_role_tests {
-    use super::is_verified_owner_email;
-
-    #[test]
-    fn owner_requires_an_exact_verified_email_match() {
-        assert!(is_verified_owner_email(Some("Mohamed@example.com"), true, "mohamed@example.com"));
-        assert!(!is_verified_owner_email(Some("mohamed@example.com"), false, "mohamed@example.com"));
-        assert!(!is_verified_owner_email(Some("someone-else@example.com"), true, "mohamed@example.com"));
-        assert!(!is_verified_owner_email(None, true, "mohamed@example.com"));
-        assert!(!is_verified_owner_email(Some("Mohamed@example.com.evil"), true, "mohamed@example.com"));
-    }
-}
 
 impl Storage {
     pub async fn connect(database_url: &str) -> Result<Self, StorageError> {
@@ -797,5 +784,19 @@ impl Storage {
             .bind(user_id).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(result.rows_affected() == 1)
+    }
+}
+
+#[cfg(test)]
+mod account_role_tests {
+    use super::is_verified_owner_email;
+
+    #[test]
+    fn owner_requires_an_exact_verified_email_match() {
+        assert!(is_verified_owner_email(Some("Mohamed@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("mohamed@example.com"), false, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("someone-else@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(None, true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("Mohamed@example.com.evil"), true, "mohamed@example.com"));
     }
 }

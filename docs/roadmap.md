@@ -12,13 +12,13 @@ The target architecture is designed up front, while completion status reflects w
 - [ ] Build and smoke-test signed installers on every advertised OS/architecture.
 
 ## Workstream 1 — Accounts/API foundations
-- [ ] Choose an identity provider and document deployment, cost, and privacy trade-offs.
+- [x] Choose Logto as the first OIDC broker candidate and document provider setup, role bootstrap and password recovery responsibilities; real provider configuration remains pending.
 - [x] Implement OIDC authorization-code callback, PKCE, state/nonce validation, JWT/JWKS checks, hashed sessions, and CSRF protection.
-- [x] Add account schema/migrations, owner-scoped transactions, and RLS for user profile, preferences, devices, download records, and device presence.
+- [x] Add account schema/migrations, owner-scoped transactions, role/status fields, and RLS for user profile, preferences, devices, download records, and device presence.
 - [x] Implement account export and deletion endpoints and web controls.
-- [x] Implement web My Downloads metadata library, user opt-in for sync, device pairing, device list/revocation, and desktop keychain-backed device credentials.
+- [x] Implement web My Downloads metadata library, user opt-in for sync, device pairing, device list/revocation, desktop keychain-backed device credentials, and owner-only user administration API/UI.
 - [x] Add local metadata-only sync outbox, opt-in backfill, atomic queue clearing when local history is deleted, retry backoff, and cross-platform build tests.
-- [ ] Run live end-to-end tests against PostgreSQL and a real OIDC provider, including multi-user isolation and account/device lifecycle scenarios.
+- [ ] Run live end-to-end tests against PostgreSQL and a real OIDC provider, including owner bootstrap, role/status changes, multi-user isolation and account/device lifecycle scenarios.
 - [ ] Add API rate limits/abuse controls, production DB TLS verification, recovery/session-management UX, and retention/backup-expiry policy.
 
 ## Workstream 2 — Shared download engine
@@ -53,7 +53,8 @@ The target architecture is designed up front, while completion status reflects w
 ## Workstream 6 — Website/distribution
 - [x] Public-site foundation and account/library screens.
 - [x] Account connection and connected-device management screens.
-- [ ] Complete documentation, compatibility, release, support, and SEO pages.
+- [x] Document account roles, OIDC broker responsibility, local/hosted database setup, and local API startup.
+- [ ] Complete compatibility, release, support, and SEO pages.
 - [ ] Multi-OS packages, checksums, SBOM, signing/notarization.
 - [ ] Safe updater/rollback, final legal/privacy notices, security disclosure, and published retention policy.
 

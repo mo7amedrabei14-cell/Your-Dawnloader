@@ -13,7 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use dawn_api_contract::UpsertDownloadRecordRequest;
-use dawn_storage::{DeviceIdentity, DeviceLinkStatus, SessionIdentity, Storage};
+use dawn_storage::{DeviceIdentity, DeviceLinkStatus, OwnerBootstrap, SessionIdentity, Storage};
 use jsonwebtoken::{
     decode, decode_header,
     jwk::{Jwk, JwkSet, KeyAlgorithm, PublicKeyUse},
@@ -692,7 +692,10 @@ async fn oidc_callback(
     let display_name = claims.name.as_deref().or(claims.preferred_username.as_deref()).or(email);
     let user_id = state.storage.upsert_oidc_user(
         &claims.iss, &claims.sub, email, email_verified, display_name,
-        &state.config.owner_email, &state.config.owner_display_name
+        OwnerBootstrap {
+            email: &state.config.owner_email,
+            display_name: &state.config.owner_display_name,
+        }
     ).await.map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "account_setup_failed"))?;
 
     let session = random_token() + &random_token();

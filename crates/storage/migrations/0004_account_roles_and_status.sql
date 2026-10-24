@@ -6,6 +6,9 @@ ALTER TABLE app_users
         CHECK (account_status IN ('active', 'suspended'));
 
 CREATE INDEX app_users_role_status_idx ON app_users(role, account_status, created_at DESC);
+-- There is one product Owner. If OWNER_EMAIL changes, the next verified Owner login transfers
+-- ownership instead of silently creating multiple accounts with full administrative authority.
+CREATE UNIQUE INDEX app_users_single_owner_idx ON app_users(role) WHERE role = 'owner';
 
 -- Preserve normal row scoping while allowing a verified Owner session to manage account profiles.
 DROP POLICY user_profiles_owner_policy ON user_profiles;

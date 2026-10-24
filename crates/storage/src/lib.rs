@@ -60,6 +60,25 @@ pub struct SessionIdentity {
     pub account_status: String,
 }
 
+fn is_verified_owner_email(email: Option<&str>, email_verified: bool, owner_email: &str) -> bool {
+    email_verified
+        && email.is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(owner_email.trim()))
+}
+
+#[cfg(test)]
+mod account_role_tests {
+    use super::is_verified_owner_email;
+
+    #[test]
+    fn owner_requires_an_exact_verified_email_match() {
+        assert!(is_verified_owner_email(Some("Mohamed@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("mohamed@example.com"), false, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("someone-else@example.com"), true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(None, true, "mohamed@example.com"));
+        assert!(!is_verified_owner_email(Some("Mohamed@example.com.evil"), true, "mohamed@example.com"));
+    }
+}
+
 impl Storage {
     pub async fn connect(database_url: &str) -> Result<Self, StorageError> {
         if database_url.trim().is_empty() { return Err(StorageError::MissingUrl); }
@@ -122,8 +141,7 @@ impl Storage {
         owner_email: &str,
         owner_display_name: &str,
     ) -> Result<Uuid, StorageError> {
-        let is_owner = email_verified && email
-            .is_some_and(|candidate| candidate.trim().eq_ignore_ascii_case(owner_email.trim()));
+        let is_owner = is_verified_owner_email(email, email_verified, owner_email);
         let account_display_name = if is_owner { Some(owner_display_name) } else { display_name };
         let mut tx = self.pool.begin().await?;
         let proposed_id = Uuid::new_v4();

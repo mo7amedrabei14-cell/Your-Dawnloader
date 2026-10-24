@@ -126,10 +126,10 @@ impl ActiveDownloadGuard {
 
 impl Drop for ActiveDownloadGuard {
     fn drop(&mut self) {
-        if let Some(active) = ACTIVE_DOWNLOADS.get() {
-            if let Ok(mut active) = active.lock() {
-                active.remove(&self.key);
-            }
+        if let Some(active) = ACTIVE_DOWNLOADS.get()
+            && let Ok(mut active) = active.lock()
+        {
+            active.remove(&self.key);
         }
     }
 }
@@ -176,13 +176,12 @@ fn validator_from_headers(headers: &reqwest::header::HeaderMap) -> Option<(Strin
             return Some(("etag".to_owned(), value.to_owned()));
         }
     }
-    if let Some(value) = headers.get(LAST_MODIFIED).and_then(|value| value.to_str().ok()) {
-        if !value.trim().is_empty()
-            && value.len() <= 128
-            && !value.chars().any(char::is_control)
-        {
-            return Some(("last-modified".to_owned(), value.to_owned()));
-        }
+    if let Some(value) = headers.get(LAST_MODIFIED).and_then(|value| value.to_str().ok())
+        && !value.trim().is_empty()
+        && value.len() <= 128
+        && !value.chars().any(char::is_control)
+    {
+        return Some(("last-modified".to_owned(), value.to_owned()));
     }
     None
 }
@@ -489,14 +488,13 @@ pub async fn download_direct(
         OpenOptions::new().write(true).create_new(true).open(&files.partial).await?
     };
 
-    if !is_resuming {
-        if let Some(metadata) = resume_metadata.as_ref() {
-            if let Err(error) = persist_resume_metadata(&files.metadata, metadata).await {
-                drop(output);
-                let _ = discard_resume_files(&files).await;
-                return Err(error);
-            }
-        }
+    if !is_resuming
+        && let Some(metadata) = resume_metadata.as_ref()
+        && let Err(error) = persist_resume_metadata(&files.metadata, metadata).await
+    {
+        drop(output);
+        let _ = discard_resume_files(&files).await;
+        return Err(error);
     }
 
     emit(&events, DownloadEvent::Started {
@@ -819,7 +817,8 @@ mod tests {
 
         assert!(download_direct(request(), CancellationToken::new(), None).await.is_err());
 
-        let source_fingerprint = fingerprint(&validate_http_url(&url).unwrap().to_string());
+        let normalized_url = validate_http_url(&url).unwrap();
+        let source_fingerprint = fingerprint(normalized_url.as_str());
         let files = resume_files(&directory, &source_fingerprint);
         let sidecar = fs::read_to_string(&files.metadata).await.unwrap();
         assert!(!sidecar.contains("do-not-store-this-secret"));

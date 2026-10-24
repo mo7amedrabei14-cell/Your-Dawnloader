@@ -41,6 +41,10 @@ export default function ConnectDeviceClient({ initialCode }: { initialCode: stri
       setError(caught instanceof Error ? caught.message : "Could not contact the account service.");
     } finally { setLoading(false); }
   }, []);
+  useEffect(() => {
+    const suppliedCode = new URLSearchParams(window.location.search).get("user_code");
+    if (suppliedCode) setCode(suppliedCode.toUpperCase());
+  }, []);
   useEffect(() => { void refresh(); }, [refresh]);
 
   async function approveDevice() {

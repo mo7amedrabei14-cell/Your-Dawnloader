@@ -6,3 +6,25 @@ ALTER TABLE app_users
         CHECK (account_status IN ('active', 'suspended'));
 
 CREATE INDEX app_users_role_status_idx ON app_users(role, account_status, created_at DESC);
+
+-- Preserve normal row scoping while allowing a verified Owner session to manage account profiles.
+DROP POLICY user_profiles_owner_policy ON user_profiles;
+CREATE POLICY user_profiles_owner_policy ON user_profiles
+    USING (
+        owner_user_id = NULLIF(current_setting('app.user_id', true), '')::uuid
+        OR EXISTS (
+            SELECT 1 FROM app_users AS actor
+            WHERE actor.id = NULLIF(current_setting('app.user_id', true), '')::uuid
+              AND actor.role = 'owner'
+              AND actor.account_status = 'active'
+        )
+    )
+    WITH CHECK (
+        owner_user_id = NULLIF(current_setting('app.user_id', true), '')::uuid
+        OR EXISTS (
+            SELECT 1 FROM app_users AS actor
+            WHERE actor.id = NULLIF(current_setting('app.user_id', true), '')::uuid
+              AND actor.role = 'owner'
+              AND actor.account_status = 'active'
+        )
+    );

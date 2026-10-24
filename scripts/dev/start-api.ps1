@@ -13,6 +13,19 @@ if (-not (Test-Path $envFile)) {
     Write-Host "Created apps\api\.env from the example. OIDC values are placeholders; real sign-in will not work until you configure a real provider." -ForegroundColor Yellow
 }
 
+# Append newly introduced owner settings without overwriting any values already configured locally.
+$exampleFile = Join-Path $apiDirectory ".env.example"
+foreach ($settingName in @("OWNER_EMAIL", "OWNER_DISPLAY_NAME")) {
+    $hasSetting = Get-Content $envFile | Where-Object { $_ -match "^\s*$settingName\s*=" } | Select-Object -First 1
+    if (-not $hasSetting) {
+        $settingLine = Get-Content $exampleFile | Where-Object { $_ -match "^\s*$settingName\s*=" } | Select-Object -First 1
+        if ($settingLine) {
+            Add-Content -Path $envFile -Value $settingLine
+            Write-Host "Added missing $settingName setting to apps\api\.env; review it before using account features." -ForegroundColor Yellow
+        }
+    }
+}
+
 # Load the API configuration locally without printing connection strings or secrets.
 Get-Content $envFile | ForEach-Object {
     $line = $_.Trim()

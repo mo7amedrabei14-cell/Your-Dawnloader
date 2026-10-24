@@ -662,7 +662,7 @@ impl Storage {
         let mut tx = self.begin_user_transaction(actor_user_id).await?;
         let rows = sqlx::query(
             "SELECT u.id, u.role, u.account_status,
-                    p.email, p.email_verified, p.display_name, p.locale,
+                    p.email, COALESCE(p.email_verified, FALSE) AS email_verified, p.display_name, p.locale,
                     to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
              FROM app_users u
              LEFT JOIN user_profiles p ON p.owner_user_id=u.id
@@ -743,7 +743,7 @@ impl Storage {
 
         let row = sqlx::query(
             "SELECT u.id, u.role, u.account_status,
-                    p.email, p.email_verified, p.display_name, p.locale,
+                    p.email, COALESCE(p.email_verified, FALSE) AS email_verified, p.display_name, p.locale,
                     to_char(u.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at
              FROM app_users u
              LEFT JOIN user_profiles p ON p.owner_user_id=u.id
